@@ -1,50 +1,46 @@
-#!/usr/bin/env bash 
+#!/usr/bin/env bash
 
 #################################################################################################
-# cxl collector
+# ndctl collector
 #################################################################################################
 
-function cxl_collector() {
-  echo "Running CXL Collector"
+function ndctl_collector() {
+  echo "Running NDCTL Collector"
 
-  if [ ${OPT_VERBOSITY} -ge 1 ]; then
-    debug_msg "Using ${CXLCLI}"
+  if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+    debug_msg "Using ${NDCTL}"
   fi
 
   IFS="" #Change the delimiter to prevent Bash separating elements by spaces
-  cxl_args=(
+  ndctl_args=(
     "version"
     "list"
-    "list --memdevs --health"
-    "list --memdevs --health --idle"
-    "list -R"
-    "list -MDT"
-    "list -vvv"
-    "list -m -I"
+    "list -i"
+    "list --regions"
   )
 
   # Initialize the progress bar
-  init_progressbar "${#cxl_args[@]}"
+  init_progressbar "${#ndctl_args[@]}"
 
-  for arg in ${cxl_args[@]}; do
+  for arg in "${ndctl_args[@]}"; do
     # Provide progress to user
     inc_progressbar
 
     # Create output files
     # Replace spaces in the command and agrs to be used as the output file name
-    OFNAME="cxl ${arg}"
+    OFNAME="ndctl ${arg}"
     OFNAME="${OFNAME// /_}" # Use the Bash string replace feature rather than calling sed or awk
     CMD_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}"
     CMD_ERR_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}.err"
-    # Run the cxl command with arguments
+    # Run the ndctl command with arguments
     # Redirect errors to the error file
-    if eval "${CXLCLI} ${arg}" 2> ${CMD_ERR_OUTPUT_FILE} 1> ${CMD_OUTPUT_FILE} ; then
-      if [ ${OPT_VERBOSITY} -ge 1 ]; then
-        debug_msg "${CXLCLI} ${arg} Command ${green}succeeded${normal}"
+    if eval "${NDCTL} ${arg}" 2> "${CMD_ERR_OUTPUT_FILE}" 1> "${CMD_OUTPUT_FILE}" ; then
+      if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+        debug_msg "${NDCTL} ${arg} Command ${green}succeeded${normal}"
       fi
     else
-      if [ ${OPT_VERBOSITY} -ge 1 ]; then
-        debug_msg "${CXLCLI} ${arg} Command ${red}failed${normal}"
+      if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+        debug_msg "${NDCTL} ${arg} Command ${red}failed${normal}"
       fi
     fi
   done
@@ -55,10 +51,10 @@ function cxl_collector() {
 # Main
 #################################################################################################
 
-# Run the cxl collector module if the 'cxl' command was found
-# Test if the $CXLCLI variable is set and is not-empty
-if [[ ! -z "${CXLCLI}" ]]; then
-  cxl_collector
+# Run the ndctl collector module if the 'ndctl' command was found
+# Test if the $NDCTL variable is set and is not-empty
+if [[ ! -z "${NDCTL}" ]]; then
+  ndctl_collector
 else
-  echo "Skipping CXL collector. 'cxl' command not found"
+  echo "Skipping NDCTL collector. 'ndctl' command not found"
 fi

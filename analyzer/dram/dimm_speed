@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_DRAM_DIMM_SPEED_}" ]; then
+  return
+fi
+_MODULE_CHECK_DRAM_DIMM_SPEED_="Loaded"
+
+# Compare each populated DIMM's Configured Memory Speed against its rated Speed
+# (dmidecode Type 17). DIMMs running below their rated speed, or a mix of
+# configured speeds, forces the memory controller to downclock all channels.
+function dram_dimm_speed() {
+  local FNAME=$1
+
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # For each populated DIMM emit "<configured>\t<rated>" (units stripped).
+  local pairs
+  mapfile -t pairs < <(${AWK} 'BEGIN{RS="";FS="\n"} {
+    isdev=0; size=""; rated=""; conf="";
+    for (i=1; i<=NF; i++) {
+      if ($i == "Memory Device") isdev=1;
+      if ($i ~ /^\tSize: /) { size=$i; sub(/^\tSize: /,"",size); }
+      if ($i ~ /^\tSpeed: /) { rated=$i; sub(/^\tSpeed: /,"",rated); }
+      if ($i ~ /^\tConfigured Memory Speed: /) { conf=$i; sub(/^\tConfigured Memory Speed: /,"",conf); }
+      else if ($i ~ /^\tConfigured Clock Speed: /) { conf=$i; sub(/^\tConfigured Clock Speed: /,"",conf); }
+    }
+    if (isdev && size != "" && size !~ /No Module Installed/) {
+      sub(/ .*/,"",rated); sub(/ .*/,"",conf);
+      print conf"\t"rated;
+    }
+  }' "${FNAME}")
+
+  if [[ ${#pairs[@]} -eq 0 ]]; then
+    rule_result SKIPPED "No populated Memory Devices found in '${FNAME}'"
+    return
+  fi
+
+  local below_rated=0
+  local conf_distinct
+  local -a conf_values=()
+  local conf rated
+  local num='^[0-9]+$'
+
+  local line
+  for line in "${pairs[@]}"; do
+    conf=${line%%$'\t'*}
+    rated=${line##*$'\t'}
+    if [[ ${conf} =~ ${num} ]]; then
+      conf_values+=("${conf}")
+      if [[ ${rated} =~ ${num} && ${conf} -lt ${rated} ]]; then
+        below_rated=1
+        info_msg "DIMM configured at ${conf} MT/s but rated for ${rated} MT/s" 2
+      fi
+    fi
+  done
+
+  if [[ ${#conf_values[@]} -eq 0 ]]; then
+    rule_result SKIPPED "No numeric configured speeds found in '${FNAME}'"
+    return
+  fi
+
+  conf_distinct=$(printf '%s\n' "${conf_values[@]}" | sort -u | ${GREP} -c '.')
+
+  if [[ ${conf_distinct} -gt 1 ]]; then
+    local conf_list
+    conf_list=$(printf '%s\n' "${conf_values[@]}" | sort -u | ${AWK} '{printf "%s%s", sep, $0; sep=", "}')
+    info_msg "Heterogeneous configured DIMM speeds: ${conf_list} MT/s" 2
+  fi
+
+  if [[ ${below_rated} -eq 1 || ${conf_distinct} -gt 1 ]]; then
+    rule_result WARNING "DIMMs are running below rated speed or at mixed speeds, forcing a downclock."
+  else
+    rule_result PASSED "All populated DIMMs are running at a uniform, rated speed."
+  fi
+}
+
+dram_dimm_speed "${OUTPUT_PATH}/dmidecode"
+
+set +x

@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_RAS_AER_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_RAS_AER_="Loaded"
+
+# Correlate PCIe Advanced Error Reporting (AER) / RAS events in the kernel log
+# with the CXL devices' PCI addresses. CXL runs over PCIe, so AER-logged
+# corrected/uncorrected/fatal errors against a CXL endpoint's BDF signal a link
+# or device RAS problem that can corrupt or stall memory traffic. This is a
+# best-effort correlation and is distinct from the LnkSta-based link-degraded
+# check (it does not parse link speed/width).
+function cxl_ras_aer_errors() {
+  local DMESG=$1          # 'dmesg -T' file
+  local LSPCI=$2          # 'lspci' file (used to find CXL BDFs)
+  local bdf=""            # A single CXL device BDF while looping
+  local nbdf=0            # Number of CXL BDFs found
+  local crit=0            # Uncorrected/Fatal AER events correlated to a CXL BDF
+  local warn=0            # Corrected AER events correlated to a CXL BDF
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${DMESG} ]] ; then
+    rule_result SKIPPED "Could not process '${DMESG}'. File not found"
+    return
+  fi
+
+  if [[ ! -f ${LSPCI} ]]; then
+    rule_result SKIPPED "Could not process '${LSPCI}'. Cannot identify CXL PCI devices."
+    return
+  fi
+
+  # Collect CXL device BDFs (first whitespace field of each CXL lspci line)
+  while read -r bdf; do
+    [[ -z ${bdf} ]] && continue
+    nbdf=$((nbdf + 1))
+    # AER lines reference the BDF; classify severity of any matching event
+    if ${GREP} -E "${bdf}" ${DMESG} | ${GREP} -qE "Uncorrected|Fatal"; then
+      crit=$((crit + 1))
+      info_msg "$(${GREP} -E "${bdf}" ${DMESG} | ${GREP} -m1 -E "Uncorrected|Fatal")" 2
+    elif ${GREP} -E "${bdf}" ${DMESG} | ${GREP} -q "Corrected"; then
+      warn=$((warn + 1))
+      info_msg "$(${GREP} -E "${bdf}" ${DMESG} | ${GREP} -m1 "Corrected")" 2
+    fi
+  done <<< "$(${GREP} -i CXL ${LSPCI} | ${AWK} '{print $1}')"
+
+  if [[ ${nbdf} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL PCI devices found in '${LSPCI}'."
+    return
+  fi
+
+  if [[ ${crit} -gt 0 ]]; then
+    rule_result CRITICAL "PCIe AER Uncorrected/Fatal error(s) were logged against ${crit} CXL device(s). This indicates a serious link/device RAS fault affecting CXL memory traffic."
+  elif [[ ${warn} -gt 0 ]]; then
+    rule_result WARNING "PCIe AER Corrected error(s) were logged against ${warn} CXL device(s). The link is recovering from errors; monitor for escalation."
+  else
+    rule_result PASSED "No PCIe AER errors correlated to the ${nbdf} CXL device(s) found."
+  fi
+}
+
+cxl_ras_aer_errors "${OUTPUT_PATH}/dmesg_-T" "${OUTPUT_PATH}/lspci"
+
+set +x

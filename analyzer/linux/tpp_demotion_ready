@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_TPP_DEMOTION_READY_}" ]; then
+  return
+fi
+_MODULE_CHECK_TPP_DEMOTION_READY_="Loaded"
+
+# Check whether Linux TPP can actually demote cold pages from DRAM to CXL. Two conditions
+# must BOTH hold:
+#   1. /sys/kernel/mm/numa/demotion_enabled must be true.
+#   2. The CXL node must be in a separate, lower memory tier than DRAM. If every NUMA node
+#      shares a single memory_tierN (because the ACPI SLIT distances barely differ), the
+#      kernel treats CXL as the same speed as DRAM and will never demote to it.
+function linux_tpp_demotion_ready() {
+  local TIERFILE=$1     # grep of /sys/devices/virtual/memory_tiering/
+  local NUMAFILE=$2     # grep of /sys/kernel/mm/numa/
+  local tier_count=0    # Number of memory_tierN tiers found
+  local single_nodelist=""  # The nodelist of the sole tier, when tier_count == 1
+  local topology_bad="" # Non-empty when DRAM and CXL are not separated into different tiers
+  local dline=""        # demotion_enabled line
+  local dvalue=""       # demotion_enabled value
+  local demotion=""     # "on" | "off" | "" (unknown)
+  local tline=""        # Loop variable while listing tiers
+
+  # Exit the function with a SKIPPED message if the tiering file doesn't exist
+  if [[ ! -f ${TIERFILE} ]] ; then
+    rule_result SKIPPED "Could not process '${TIERFILE}'. Memory tiering sysfs not collected; kernel may not support tiered memory."
+    return
+  fi
+
+  # --- Tier-topology gate ---
+  tier_count=$(${GREP} -oE "memory_tier[0-9]+/nodelist:" ${TIERFILE} | ${GREP} -c "")
+  if [[ ${tier_count} -eq 0 ]]; then
+    rule_result SKIPPED "No memory tiers found in '${TIERFILE}'. Kernel may not support tiered memory."
+    return
+  fi
+
+  # Report each tier and its nodelist
+  while read -r tline; do
+    [[ -z ${tline} ]] && continue
+    info_msg "${tline##*memory_tiering/}" 2
+  done <<< "$(${GREP} -E "memory_tier[0-9]+/nodelist:" ${TIERFILE})"
+
+  if [[ ${tier_count} -eq 1 ]]; then
+    single_nodelist=$(${GREP} -oE "memory_tier[0-9]+/nodelist:.*" ${TIERFILE} | ${GREP} -oE ":.*$" | ${GREP} -oE "[0-9,-]+")
+    # A nodelist spanning more than one node (a range or comma list) means DRAM and CXL
+    # are lumped into the same single tier.
+    if [[ ${single_nodelist} == *-* || ${single_nodelist} == *,* ]]; then
+      topology_bad="yes"
+    fi
+  fi
+
+  # --- Demotion gate ---
+  dline=$(${GREP} "demotion_enabled:" "${NUMAFILE}" 2>/dev/null)
+  if [[ -n ${dline} ]]; then
+    dvalue="${dline#*demotion_enabled:}"
+    case "${dvalue,,}" in
+      1|true|y|yes) demotion="on" ;;
+      0|false|n|no) demotion="off" ;;
+      *)            demotion="" ;;
+    esac
+  fi
+
+  # --- Combined verdict ---
+  if [[ -n ${topology_bad} || ${demotion} == "off" ]]; then
+    local reasons=""
+    if [[ ${demotion} == "off" ]]; then
+      reasons="demotion is disabled (/sys/kernel/mm/numa/demotion_enabled=false)"
+    fi
+    if [[ -n ${topology_bad} ]]; then
+      [[ -n ${reasons} ]] && reasons+=" AND "
+      reasons+="all NUMA nodes share a single memory tier (nodes '${single_nodelist}'), so the kernel treats CXL as the same speed as DRAM"
+    fi
+    rule_result WARNING "TPP demotion to CXL cannot work: ${reasons}. Enable demotion ('echo 1 > /sys/kernel/mm/numa/demotion_enabled') and ensure the CXL node is isolated in a lower memory tier (this depends on the platform's ACPI HMAT/SLIT distances)."
+    return
+  fi
+
+  # topology OK (>=2 tiers, or single-node tier) and demotion not disabled
+  if [[ ${demotion} == "on" ]]; then
+    rule_result PASSED "TPP can demote cold pages to CXL: demotion is enabled and the CXL node is in a separate/lower memory tier (${tier_count} tiers)."
+  else
+    rule_result PASSED "Memory tiers are differentiated (${tier_count} tiers), but demotion_enabled could not be determined - verify /sys/kernel/mm/numa/demotion_enabled is set."
+  fi
+}
+
+# Call the main function
+linux_tpp_demotion_ready "${OUTPUT_PATH}/grep_-r_.__sys_devices_virtual_memory_tiering_" "${OUTPUT_PATH}/grep_-r_.__sys_kernel_mm_numa_"
+
+set +x

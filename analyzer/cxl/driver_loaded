@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_DRIVER_LOADED_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_DRIVER_LOADED_="Loaded"
+
+# Check that the CXL kernel driver stack is loaded. If CXL devices are present in sysfs but
+# cxl_mem / cxl_pci are not loaded, CXL memory devices (memdevs) will not enumerate and most
+# other CXL tooling/rules will come up empty.
+function cxl_driver_loaded() {
+  local FNAME=$1        # lsmod output
+  local SYSFS=$2        # 'ls -l /sys/bus/cxl/devices/' output (device presence)
+  local missing=""      # Space-separated list of expected-but-absent modules
+  local m
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  for m in cxl_core cxl_pci cxl_mem cxl_acpi cxl_port; do
+    if ! ${GREP} -qE "^${m}\b" ${FNAME}; then
+      missing+="${m} "
+    fi
+  done
+
+  # Are CXL devices actually present on this host?
+  local have_devices="no"
+  if [[ -f ${SYSFS} ]] && ${GREP} -qE "decoder|mem|port|region|endpoint" "${SYSFS}"; then
+    have_devices="yes"
+  fi
+
+  if [[ -z ${missing} ]]; then
+    rule_result PASSED "All expected CXL kernel modules are loaded (cxl_core, cxl_pci, cxl_mem, cxl_acpi, cxl_port)."
+    return
+  fi
+
+  # Some modules missing. Modules can be builtin (absent from lsmod) - only worry if devices
+  # exist but the memory-device drivers are missing.
+  if [[ ${have_devices} == "yes" ]]; then
+    if [[ " ${missing} " == *" cxl_mem "* || " ${missing} " == *" cxl_pci "* ]]; then
+      rule_result WARNING "CXL devices are present but key driver(s) are not loaded: ${missing}. CXL memory devices (memdevs) will not enumerate - check that cxl_pci/cxl_mem load (e.g. mixed VH/RCH hierarchy or driver/boot issue)."
+    else
+      rule_result INFO "CXL devices are present; modules not shown by lsmod (may be builtin): ${missing}."
+    fi
+  else
+    rule_result INFO "No CXL devices detected in /sys/bus/cxl/devices/. Missing modules (${missing}) may simply be unneeded on this host."
+  fi
+}
+
+# Call the main function
+cxl_driver_loaded "${OUTPUT_PATH}/lsmod" "${OUTPUT_PATH}/ls_-l__sys_bus_cxl_devices_"
+
+set +x

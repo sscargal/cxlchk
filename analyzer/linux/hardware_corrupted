@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_HARDWARE_CORRUPTED_}" ]; then
+  return
+fi
+_MODULE_CHECK_HARDWARE_CORRUPTED_="Loaded"
+
+# Detect memory corruption: the HardwareCorrupted counter in /proc/meminfo (pages poisoned by
+# memory errors) plus Machine Check / hardware-error signatures in the kernel log. Complements
+# linux/edac_errors by catching errors even where EDAC is not wired up.
+function linux_hardware_corrupted() {
+  local FNAME=$1        # /proc/meminfo
+  local DMESG=$2        # dmesg -T (and /var/log/messages via a second path if desired)
+  local corrupted=""    # HardwareCorrupted value in kB
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  corrupted=$(${GREP} -E "^HardwareCorrupted:" ${FNAME} | ${AWK} '{print $2}')
+
+  # Look for fatal/uncorrected machine-check and hardware-error signatures in the log.
+  # Case-sensitive, specific patterns - a broad case-insensitive match falsely hits benign
+  # lines (e.g. the "ce" in "device" on EDAC init messages).
+  local fatal=""
+  local corrected=""
+  if [[ -f ${DMESG} ]]; then
+    if ${GREP} -qE "[0-9]+ UE (memory|error)|Uncorrected [Hh]ardware [Ee]rror|[Hh]ardware [Ee]rror.*[Uu]ncorrect|mce:.*[Uu]ncorrect|Fatal [Mm]achine [Cc]heck|Kernel panic.*[Mm]achine [Cc]heck" ${DMESG}; then
+      fatal="yes"
+    fi
+    if ${GREP} -qE "[0-9]+ CE (memory|error)|Corrected [Hh]ardware [Ee]rror|mce:.*[Cc]orrected" ${DMESG}; then
+      corrected="yes"
+    fi
+  fi
+
+  if [[ -n ${corrupted} && ${corrupted} -gt 0 ]] || [[ -n ${fatal} ]]; then
+    rule_result CRITICAL "Memory corruption detected: HardwareCorrupted=${corrupted:-0} kB$( [[ -n ${fatal} ]] && echo ", and uncorrected/fatal machine-check errors are present in the kernel log" ). This is a data-integrity risk."
+  elif [[ -n ${corrected} ]]; then
+    rule_result WARNING "Corrected hardware/machine-check errors are present in the kernel log (HardwareCorrupted=${corrupted:-0} kB). A memory component may be marginal - investigate."
+  else
+    rule_result PASSED "No corrupted memory pages (HardwareCorrupted=${corrupted:-0} kB) and no machine-check errors in the kernel log."
+  fi
+}
+
+# Call the main function
+linux_hardware_corrupted "${OUTPUT_PATH}/meminfo" "${OUTPUT_PATH}/dmesg_-T"
+
+set +x

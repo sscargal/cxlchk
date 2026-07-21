@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_DEVICE_COUNT_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_DEVICE_COUNT_="Loaded"
+
+# Cross-check the CXL hardware inventory against what actually became usable memory. Three
+# tiers are counted:
+#   - host bridges (AICs): distinct ACPI0016:NN root dports in 'cxl list -vvv'
+#   - CXL endpoint devices visible on PCIe: 'CXL:'-class device lines in 'lspci'
+#   - usable memory devices: memdevs in 'cxl list --memdevs --health'
+# A card that appears as a bridge/endpoint but never becomes a memdev points to an enumeration
+# or driver problem (cxl_mem/cxl_pci not bound, RCH/VH mismatch) - its capacity is unusable.
+function cxl_device_count() {
+  local HEALTH=$1         # 'cxl list --memdevs --health' JSON
+  local LSPCI=$2          # 'lspci' text
+  local VVV=$3            # 'cxl list -vvv' JSON
+  local bridges=0         # CXL host bridges (AICs)
+  local endpoints=0       # CXL endpoint devices on the PCIe bus
+  local memdevs=0         # CXL memory devices that enumerated as usable
+
+  # If none of the sources exist there is nothing to check
+  if [[ ! -f ${HEALTH} && ! -f ${LSPCI} && ! -f ${VVV} ]]; then
+    rule_result SKIPPED "Could not process any CXL inventory source (health/lspci/cxl -vvv). File not found"
+    return
+  fi
+
+  if [[ -f ${VVV} ]]; then
+    bridges=$(${GREP} -oE "ACPI0016:[0-9]+" ${VVV} | sort -u | ${GREP} -c "")
+  fi
+  if [[ -f ${LSPCI} ]]; then
+    # Match a device-header line whose class is 'CXL:' (a CXL endpoint/memory device)
+    endpoints=$(${GREP} -cE "^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f][[:space:]]+CXL:" ${LSPCI})
+  fi
+  if [[ -f ${HEALTH} ]]; then
+    memdevs=$(${GREP} -oE "\"memdev\":\"mem[0-9]+\"" ${HEALTH} | ${GREP} -c "")
+  fi
+
+  # Nothing CXL anywhere
+  if [[ ${bridges} -eq 0 && ${endpoints} -eq 0 && ${memdevs} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL host bridges, endpoint devices, or memory devices found. CXL may not be present."
+    return
+  fi
+
+  info_msg "CXL host bridges (AICs): ${bridges}; CXL endpoint devices on PCIe: ${endpoints}; enumerated CXL memory devices (memdev): ${memdevs}" 2
+
+  # Expected usable memdevs is bounded below by what the hardware exposes
+  local expected=${bridges}
+  [[ ${endpoints} -gt ${expected} ]] && expected=${endpoints}
+
+  if [[ ${memdevs} -eq 0 && ${expected} -gt 0 ]]; then
+    rule_result WARNING "CXL hardware is present (${bridges} host bridge(s), ${endpoints} endpoint device(s) on PCIe) but 0 enumerated as usable CXL memory devices. The capacity is not usable via the CXL stack - check cxl_pci/cxl_mem binding and VH/RCH host-bridge mode."
+  elif [[ ${memdevs} -lt ${expected} ]]; then
+    rule_result WARNING "Only ${memdevs} of ${expected} CXL device(s) became usable memory devices (memdev). One or more CXL cards did not bind to the memory driver (enumeration/driver issue) - that capacity is unusable."
+  else
+    rule_result PASSED "All CXL devices enumerated as usable memory devices: ${memdevs} memdev(s) for ${expected} CXL device(s) on the bus."
+  fi
+}
+
+cxl_device_count "${OUTPUT_PATH}/cxl_list_--memdevs_--health" "${OUTPUT_PATH}/lspci" "${OUTPUT_PATH}/cxl_list_-vvv"
+
+set +x

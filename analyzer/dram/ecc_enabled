@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_DRAM_ECC_ENABLED_}" ]; then
+  return
+fi
+_MODULE_CHECK_DRAM_ECC_ENABLED_="Loaded"
+
+# Verify ECC is enabled on the Physical Memory Arrays (dmidecode Type 16).
+# ECC reported as "None" means single-bit errors go undetected/uncorrected,
+# a silent data-corruption risk that is compounded on far CXL memory.
+function dram_ecc_enabled() {
+  local FNAME=$1
+
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Collect every "Error Correction Type:" line (Type 16 Physical Memory Array).
+  local ecc_lines
+  mapfile -t ecc_lines < <(${GREP} -E '^[[:space:]]*Error Correction Type:' "${FNAME}")
+
+  if [[ ${#ecc_lines[@]} -eq 0 ]]; then
+    rule_result SKIPPED "No 'Error Correction Type' entries found in '${FNAME}'"
+    return
+  fi
+
+  local none_found=0
+  local value line
+  for line in "${ecc_lines[@]}"; do
+    value=${line#*: }
+    value=$(printf '%s' "${value}" | ${SED} -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    info_msg "Error Correction Type: ${value}" 2
+    if [[ ${value} == "None" ]]; then
+      none_found=1
+    fi
+  done
+
+  if [[ ${none_found} -eq 1 ]]; then
+    rule_result CRITICAL "ECC is disabled or absent on one or more memory arrays (Error Correction Type: None). Silent memory corruption is possible."
+  else
+    rule_result PASSED "ECC is enabled on all Physical Memory Arrays."
+  fi
+}
+
+dram_ecc_enabled "${OUTPUT_PATH}/dmidecode"
+
+set +x

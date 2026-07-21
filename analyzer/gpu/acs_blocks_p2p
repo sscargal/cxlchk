@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_ACS_P2P_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_ACS_P2P_="Loaded"
+
+# Check whether PCIe Access Control Services (ACS) is configured to force peer-to-peer (P2P)
+# TLPs upstream to the root complex. When an ACS-capable bridge/port has 'SrcValid+' together
+# with 'ReqRedir+' or 'CmpltRedir+', peer traffic is redirected upstream instead of being
+# routed directly between devices - this breaks GPUDirect P2P and GPUDirect Storage (GDS).
+# Disabling ACS restores P2P but is a security/isolation tradeoff, so this is reported as a
+# WARNING rather than a hard failure.
+function gpu_acs_blocks_p2p() {
+  local FNAME=$1              # 'lspci -vv' output
+  local blocking_ports=0     # Ports forcing P2P TLPs upstream
+  local acs_ports=0          # Ports that expose ACSCtl bits at all
+  local bridge_seen=0        # Whether any bridge/port record was seen
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Stateful pass: track the current device record and whether it is a bridge/port, then test
+  # the ACSCtl bits that appear underneath it.
+  local acs_detail
+  acs_detail="$(${AWK} '
+    # A new device record starts with a BB:DD.F header at column 1; remember its BDF
+    /^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]/ {
+      is_port = 0
+      hdr = $1
+      if ($0 ~ /PCI bridge/ || $0 ~ /Root Port/ || $0 ~ /Downstream Port/ || $0 ~ /Upstream Port/) {
+        is_port = 1
+      }
+      next
+    }
+    /ACSCtl:/ {
+      if (is_port && $0 ~ /SrcValid\+/ && ($0 ~ /ReqRedir\+/ || $0 ~ /CmpltRedir\+/)) {
+        print "Port " hdr " forces P2P TLPs upstream (ACS SrcValid+ ReqRedir+/CmpltRedir+)"
+      }
+    }
+  ' "${FNAME}")"
+  if [[ -n ${acs_detail} ]]; then
+    while read -r line; do
+      info_msg "${line}" 2
+    done <<< "${acs_detail}"
+  fi
+
+  # Recompute the counts (the awk above printed them on a COUNTS line for parsing)
+  bridge_seen=$(${AWK} '
+    /^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]/ {
+      if ($0 ~ /PCI bridge/ || $0 ~ /Root Port/ || $0 ~ /Downstream Port/ || $0 ~ /Upstream Port/) c++
+    }
+    END { print c+0 }
+  ' "${FNAME}")
+  acs_ports=$(${AWK} '
+    /^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]/ {
+      is_port = ($0 ~ /PCI bridge/ || $0 ~ /Root Port/ || $0 ~ /Downstream Port/ || $0 ~ /Upstream Port/) ? 1 : 0
+    }
+    /ACSCtl:/ { if (is_port) c++ }
+    END { print c+0 }
+  ' "${FNAME}")
+  blocking_ports=$(${AWK} '
+    /^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]/ {
+      is_port = ($0 ~ /PCI bridge/ || $0 ~ /Root Port/ || $0 ~ /Downstream Port/ || $0 ~ /Upstream Port/) ? 1 : 0
+    }
+    /ACSCtl:/ {
+      if (is_port && $0 ~ /SrcValid\+/ && ($0 ~ /ReqRedir\+/ || $0 ~ /CmpltRedir\+/)) c++
+    }
+    END { print c+0 }
+  ' "${FNAME}")
+
+  if (( bridge_seen == 0 )); then
+    rule_result SKIPPED "No PCIe bridges/ports found in '${FNAME}'."
+    return
+  fi
+
+  if (( acs_ports == 0 )); then
+    rule_result INFO "PCIe bridges/ports are present but no ACSCtl bits were reported - collect 'lspci -vv' as root to evaluate whether ACS blocks GPU P2P."
+    return
+  fi
+
+  if (( blocking_ports >= 1 )); then
+    rule_result WARNING "${blocking_ports} PCIe port(s) have ACS redirect enabled (SrcValid+ with ReqRedir+/CmpltRedir+), which forces P2P TLPs upstream and blocks GPUDirect P2P/GDS. Disabling ACS restores P2P but is a security/isolation tradeoff."
+    return
+  fi
+
+  rule_result PASSED "All ${acs_ports} ACS-capable PCIe port(s) have SrcValid- (ACS is not redirecting P2P traffic upstream); GPU P2P is not blocked by ACS."
+}
+
+# Call the main function
+gpu_acs_blocks_p2p "${OUTPUT_PATH}/lspci_-vv"
+
+set +x

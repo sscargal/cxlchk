@@ -12,6 +12,17 @@ function collect_files() {
     "/proc/cmdline"
     "/proc/meminfo"
     "/proc/modules"
+    "/proc/sys/kernel/numa_balancing"
+    "/etc/os-release"
+    "/proc/cpuinfo"
+    "/sys/kernel/mm/transparent_hugepage/enabled"
+    "/sys/kernel/mm/transparent_hugepage/defrag"
+    "/sys/devices/system/memory/auto_online_blocks"
+    "/proc/sys/vm/zone_reclaim_mode"
+    "/proc/sys/vm/min_free_kbytes"
+    "/proc/sys/vm/swappiness"
+    "/proc/sys/vm/overcommit_memory"
+    "/proc/sys/vm/watermark_scale_factor"
   )
 
   # Initialize the progress bar

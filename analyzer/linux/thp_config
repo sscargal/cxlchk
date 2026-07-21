@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_THP_CONFIG_}" ]; then
+  return
+fi
+_MODULE_CHECK_THP_CONFIG_="Loaded"
+
+# Report Transparent Huge Page (THP) enabled/defrag policy. Aggressive defrag
+# ('always') triggers synchronous compaction that hurts the latency
+# predictability that tiered CXL memory depends on.
+function linux_thp_config() {
+  local FNAME=$1        # transparent_hugepage/enabled
+  local FDEFRAG=$2      # transparent_hugepage/defrag
+
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # The active option is the one wrapped in [brackets], e.g. "always [madvise] never"
+  local enabled defrag
+  enabled=$(${GREP} -oE '\[[a-z_]+\]' "${FNAME}" | ${SED} -e 's/[][]//g')
+  [[ -z ${enabled} ]] && enabled="unknown"
+
+  if [[ -f ${FDEFRAG} ]]; then
+    defrag=$(${GREP} -oE '\[[a-z_]+\]' "${FDEFRAG}" | ${SED} -e 's/[][]//g')
+    [[ -z ${defrag} ]] && defrag="unknown"
+  else
+    defrag="unknown"
+  fi
+
+  if [[ ${defrag} == "always" ]]; then
+    rule_result WARNING "THP defrag='always' (enabled='${enabled}'). Aggressive compaction hurts tiered-memory latency predictability."
+  elif [[ ${enabled} == "never" ]]; then
+    rule_result INFO "THP is disabled (enabled='never', defrag='${defrag}')."
+  else
+    rule_result INFO "THP enabled='${enabled}', defrag='${defrag}'."
+  fi
+}
+
+linux_thp_config "${OUTPUT_PATH}/enabled" "${OUTPUT_PATH}/defrag"
+
+set +x

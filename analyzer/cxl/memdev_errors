@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_MEMDEV_ERRORS_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_MEMDEV_ERRORS_="Loaded"
+
+# Check the accumulated error counters reported by CXL memory devices in
+# 'cxl list --memdevs --health'. Devices track corrected/uncorrected error
+# counts separately for volatile (RAM) and persistent (pmem) capacity. Non-zero
+# counts mean the media has been logging errors and warrant investigation before
+# the host relies on that CXL capacity for production workloads.
+function cxl_memdev_errors() {
+  local FNAME=$1          # 'cxl list --memdevs --health' JSON
+  local ndev=0            # Number of memdevs
+  local vol_total=0       # Sum of volatile_errors
+  local pmem_total=0      # Sum of pmem_errors
+  local have_vol=0        # Whether the volatile_errors field is present
+  local have_pmem=0       # Whether the pmem_errors field is present
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  ndev=$(${GREP} -oE "\"memdev\":\"mem[0-9]+\"" ${FNAME} | ${GREP} -c "")
+  if [[ ${ndev} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL memory devices found in '${FNAME}'. memdevs may not enumerate."
+    return
+  fi
+
+  have_vol=$(${GREP} -oE "\"volatile_errors\":[0-9]+" ${FNAME} | ${GREP} -c "")
+  have_pmem=$(${GREP} -oE "\"pmem_errors\":[0-9]+" ${FNAME} | ${GREP} -c "")
+
+  # If neither error field is present, there is nothing to evaluate
+  if [[ ${have_vol} -eq 0 && ${have_pmem} -eq 0 ]]; then
+    rule_result SKIPPED "No volatile_errors/pmem_errors fields found in '${FNAME}'."
+    return
+  fi
+
+  vol_total=$(${GREP} -oE "\"volatile_errors\":[0-9]+" ${FNAME} | ${GREP} -oE "[0-9]+$" | ${AWK} 'BEGIN{s=0} {s+=$1} END{print s+0}')
+  pmem_total=$(${GREP} -oE "\"pmem_errors\":[0-9]+" ${FNAME} | ${GREP} -oE "[0-9]+$" | ${AWK} 'BEGIN{s=0} {s+=$1} END{print s+0}')
+
+  if [[ ${vol_total} -gt 0 || ${pmem_total} -gt 0 ]]; then
+    rule_result WARNING "CXL memory devices report accumulated media errors: ${vol_total} volatile error(s), ${pmem_total} pmem error(s) across ${ndev} device(s). Investigate before relying on this CXL capacity."
+  else
+    rule_result PASSED "All ${ndev} CXL memory device(s) report zero accumulated volatile/pmem errors."
+  fi
+}
+
+cxl_memdev_errors "${OUTPUT_PATH}/cxl_list_--memdevs_--health"
+
+set +x

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_POISON_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_POISON_="Loaded"
+
+# Check for CXL media poison events in the kernel log. (This ndctl's 'cxl list' has no
+# media-error/poison subcommand, so dmesg is the portable source.) A poisoned address is a
+# physical memory location the device flagged as bad; a read to it raises a machine-check and
+# can crash a workload or the host - a data-integrity CRITICAL on a CXL memory host.
+function cxl_poison_list() {
+  local FNAME=$1          # dmesg -T
+  local nrec=0            # Number of matching poison log lines
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Match CXL-attributed poison / media-error log lines (case-insensitive, but anchored to
+  # 'cxl' + 'poison'/'media error' together to avoid unrelated poison mentions).
+  nrec=$(${GREP} -iE "cxl.*poison|poison.*cxl|cxl.*media error|cxl_poison" ${FNAME} | ${GREP} -c "")
+  if [[ ${nrec} -gt 0 ]]; then
+    rule_result CRITICAL "Found ${nrec} CXL poison / media-error event(s) in the kernel log. Reads to a poisoned address raise a machine-check and can crash workloads or the host. Inspect the 'cxl'+'poison' lines in dmesg."
+  else
+    rule_result PASSED "No CXL poison / media-error events found in the kernel log."
+  fi
+}
+
+cxl_poison_list "${OUTPUT_PATH}/dmesg_-T"
+
+set +x

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_TPP_STATE_}" ]; then
+  return
+fi
+_MODULE_CHECK_TPP_STATE_="Loaded"
+
+# Report whether Linux TPP (Transparent Page Placement) memory-tiering is enabled via the
+# NUMA_BALANCING_MEMORY_TIERING bit (0x2) of /proc/sys/kernel/numa_balancing
+function linux_tpp_state() {
+  local FNAME=$1        # File name to process
+  local val=""          # numa_balancing sysctl value
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  read -r val < "${FNAME}"
+
+  if ! [[ ${val} =~ ^[0-9]+$ ]]; then
+    rule_result SKIPPED "Unrecognized 'numa_balancing' value: '${val}'"
+    return
+  fi
+
+  if (( (val & 2) != 0 )); then
+    rule_result INFO "Linux TPP (Transparent Page Placement) memory tiering is ENABLED (numa_balancing=${val} includes the NUMA_BALANCING_MEMORY_TIERING bit). The kernel will automatically promote hot pages from CXL to DRAM, and demote cold pages the other way, based on NUMA hint faults."
+  else
+    rule_result INFO "Linux TPP (Transparent Page Placement) memory tiering is NOT enabled (numa_balancing=${val} does not include the NUMA_BALANCING_MEMORY_TIERING bit, or this kernel does not support it). Automatic DRAM<->CXL page promotion/demotion via NUMA balancing will not occur. See the 'numa_demotion_state' rule for the related demotion_enabled setting."
+  fi
+}
+
+# Call the main function
+linux_tpp_state "${OUTPUT_PATH}/numa_balancing"
+
+set +x

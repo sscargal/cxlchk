@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_FW_CONSISTENCY_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_FW_CONSISTENCY_="Loaded"
+
+# Check that all CXL memory devices (AICs) run the same firmware version. When a
+# host has multiple CXL cards from the same model/vendor but on mixed firmware,
+# their latency/bandwidth and feature behavior can differ, producing asymmetric
+# performance across an interleave set and hard-to-diagnose tail latency. Reads
+# 'cxl list -vvv' first and falls back to 'cxl list -m -I' if the former carries
+# no firmware_version fields.
+function cxl_firmware_consistency() {
+  local CXLV=$1           # 'cxl list -vvv' JSON
+  local IDENT=$2          # 'cxl list -m -I' JSON (fallback)
+  local versions=""       # Distinct firmware_version values
+  local count=0           # Number of distinct versions
+
+  # Both sources missing -> nothing to evaluate
+  if [[ ! -f ${CXLV} && ! -f ${IDENT} ]]; then
+    rule_result SKIPPED "Could not process '${CXLV}' or '${IDENT}'. File not found"
+    return
+  fi
+
+  if [[ -f ${CXLV} ]]; then
+    versions=$(${GREP} -oE "\"firmware_version\":\"[^\"]+\"" ${CXLV} | sort -u)
+  fi
+
+  # Fall back to the identify output if the hierarchy carried no firmware info
+  if [[ -z ${versions} && -f ${IDENT} ]]; then
+    versions=$(${GREP} -oE "\"firmware_version\":\"[^\"]+\"" ${IDENT} | sort -u)
+  fi
+
+  if [[ -z ${versions} ]]; then
+    rule_result SKIPPED "No firmware_version fields found in the CXL data."
+    return
+  fi
+
+  count=$(printf '%s\n' "${versions}" | ${GREP} -c "")
+
+  if [[ ${count} -gt 1 ]]; then
+    while read -r v; do
+      info_msg "${v}" 2
+    done <<< "${versions}"
+    rule_result WARNING "Multiple (${count}) distinct CXL firmware versions detected across devices. Mixed firmware on similar AICs can cause asymmetric performance across an interleave set. Align firmware across devices."
+  else
+    rule_result PASSED "All CXL devices run a single firmware version (${versions})."
+  fi
+}
+
+cxl_firmware_consistency "${OUTPUT_PATH}/cxl_list_-vvv" "${OUTPUT_PATH}/cxl_list_-m_-I"
+
+set +x

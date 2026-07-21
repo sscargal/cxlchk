@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_EDAC_ERRORS_}" ]; then
+  return
+fi
+_MODULE_CHECK_EDAC_ERRORS_="Loaded"
+
+# Sum EDAC memory-controller error counters. Correctable errors (CE) indicate marginal
+# media/links (latency spikes from retries, a precursor to hard failure); uncorrectable
+# errors (UE) are a data-integrity / correctness problem.
+function linux_edac_errors() {
+  local FNAME=$1        # grep of /sys/devices/system/edac/mc/*/{ce,ue}_count + dimm labels
+  local ce=0            # Total correctable errors
+  local ue=0            # Total uncorrectable errors
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. EDAC not present (no memory-controller error-detection driver loaded)."
+    return
+  fi
+
+  # Sum controller-level ce_count / ue_count lines (exclude per-dimm to avoid double count)
+  ce=$(${GREP} -E "/mc[0-9]+/ce_count:" ${FNAME} | ${AWK} -F: 'BEGIN{s=0}{s+=$NF}END{print s+0}')
+  ue=$(${GREP} -E "/mc[0-9]+/ue_count:" ${FNAME} | ${AWK} -F: 'BEGIN{s=0}{s+=$NF}END{print s+0}')
+
+  if [[ ${ue} -gt 0 ]]; then
+    rule_result CRITICAL "EDAC reports ${ue} uncorrectable memory error(s) (and ${ce} correctable). This is a data-integrity risk - inspect /sys/devices/system/edac/mc/ and identify the failing DIMM."
+  elif [[ ${ce} -gt 0 ]]; then
+    rule_result WARNING "EDAC reports ${ce} correctable memory error(s). A DIMM/rank/link may be marginal (latency impact and a precursor to uncorrectable errors) - check dimm_label mappings."
+  else
+    rule_result PASSED "EDAC reports no correctable or uncorrectable memory errors."
+  fi
+}
+
+# Call the main function
+linux_edac_errors "${OUTPUT_PATH}/grep_-rs_.__sys_devices_system_edac_mc__--include=ce_count_--include=ue_count_--include=dimm_label_--include=dimm_ce_count_--include=dimm_ue_count"
+
+set +x

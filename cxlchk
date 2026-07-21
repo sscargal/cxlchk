@@ -14,6 +14,7 @@ SCRIPT_NAME=${0##*/}				# Name of this script
 SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]:-$0}"; )" &> /dev/null && pwd 2> /dev/null; )"	# Provides the full directory name of the script no matter where it is being called from
 
 DAXCTL=("$(command -v daxctl)")     # Path to daxctl
+NDCTL=("$(command -v ndctl)")       # Path to ndctl
 CXLCLI=("$(command -v cxl)")			  # Path to cxl, use -c option to specify the location of the cxl binary
 BC=("$(command -v bc)")				      # Path to bc
 NUMACTL=("$(command -v numactl)")		# Path to numactl
@@ -109,13 +110,24 @@ function verify_cmds() {
 
   # daxctl is optional
   if [ ! -x "${DAXCTL}" ]; then
-    echo "ERROR: daxctl command not found!" 
+    echo "ERROR: daxctl command not found!"
     err_state=false
   else
     echo "Using DAXCTL command: ${DAXCTL}"
     TOKENS=( $(${DAXCTL} version 2>&1 ) )
     DAXCTL_VER=${TOKENS[-1]}
     echo "DAXCTL version: ${DAXCTL_VER}"
+  fi
+
+  # ndctl is optional
+  if [ ! -x "${NDCTL}" ]; then
+    echo "INFO: ndctl command not found!"
+    err_state=false
+  else
+    echo "Using NDCTL command: ${NDCTL}"
+    TOKENS=( $(${NDCTL} version 2>&1 ) )
+    NDCTL_VER=${TOKENS[-1]}
+    echo "NDCTL version: ${NDCTL_VER}"
   fi
 
   # cxl is optional and only available in NDCTL version 72 or later

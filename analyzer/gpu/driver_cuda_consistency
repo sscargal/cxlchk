@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_DRIVER_CUDA_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_DRIVER_CUDA_="Loaded"
+
+# Check that the NVIDIA driver is binding all NVIDIA display/3D controllers present on the bus,
+# and report the driver and CUDA versions. If nvidia-smi enumerates fewer GPUs than lspci shows
+# NVIDIA 3D/VGA controllers, some GPUs are not being driven (missing/mismatched driver, failed
+# init, or a device left bound to vfio-pci) -> FAILED.
+function gpu_driver_cuda_consistency() {
+  local FNAME=$1          # 'nvidia-smi -q' output
+  local LSPCI=$2          # plain 'lspci' output
+  local gpu_count=0       # GPUs enumerated by nvidia-smi
+  local nvidia_ctrls=0    # NVIDIA 3D/VGA controllers on the PCI bus
+  local nvidia_pci=0      # Total NVIDIA PCI functions (approximate; may include audio)
+  local driver_ver=""     # Driver Version
+  local cuda_ver=""       # CUDA Version
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. nvidia-smi not available or no NVIDIA GPUs present."
+    return
+  fi
+
+  gpu_count=$(${GREP} -c '^GPU 0' "${FNAME}")
+  if (( gpu_count == 0 )); then
+    rule_result SKIPPED "'${FNAME}' enumerated no GPUs (nvidia-smi driver error)."
+    return
+  fi
+
+  driver_ver=$(${GREP} -m1 "Driver Version" "${FNAME}" | ${AWK} -F: '{gsub(/^ +| +$/,"",$2); print $2}')
+  cuda_ver=$(${GREP} -m1 "CUDA Version" "${FNAME}" | ${AWK} -F: '{gsub(/^ +| +$/,"",$2); print $2}')
+  info_msg "Driver Version: ${driver_ver:-unknown}" 2
+  info_msg "CUDA Version: ${cuda_ver:-unknown}" 2
+  info_msg "GPUs enumerated by nvidia-smi: ${gpu_count}" 2
+
+  if [[ -f ${LSPCI} ]]; then
+    # NVIDIA 3D/VGA controllers only (the actual GPUs), not audio/bridge functions
+    nvidia_ctrls=$(${GREP} -iE "(3D controller|VGA compatible controller).*NVIDIA" "${LSPCI}" | ${GREP} -c .)
+    nvidia_pci=$(${GREP} -ci nvidia "${LSPCI}")
+    info_msg "NVIDIA 3D/VGA controllers on bus (lspci): ${nvidia_ctrls}" 2
+    info_msg "Total NVIDIA PCI functions (lspci -ci nvidia, approximate - may include audio functions): ${nvidia_pci}" 2
+
+    if (( nvidia_ctrls > 0 && gpu_count < nvidia_ctrls )); then
+      rule_result FAILED "nvidia-smi enumerated ${gpu_count} GPU(s) but lspci shows ${nvidia_ctrls} NVIDIA 3D/VGA controller(s). The NVIDIA driver is not binding all GPUs (driver mismatch, failed init, or a device bound to vfio-pci). Driver ${driver_ver:-unknown}, CUDA ${cuda_ver:-unknown}."
+      return
+    fi
+  else
+    info_msg "'${LSPCI}' not found - cannot cross-check GPU count against the PCI bus." 2
+  fi
+
+  rule_result PASSED "NVIDIA driver ${driver_ver:-unknown} (CUDA ${cuda_ver:-unknown}) is driving all ${gpu_count} enumerated GPU(s), consistent with the PCI bus."
+}
+
+# Call the main function
+gpu_driver_cuda_consistency "${OUTPUT_PATH}/nvidia-smi_-q" "${OUTPUT_PATH}/lspci"
+
+set +x

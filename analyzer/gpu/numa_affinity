@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_NUMA_AFFINITY_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_NUMA_AFFINITY_="Loaded"
+
+# Check whether each GPU exposes a valid NUMA affinity in the nvidia-smi topology matrix.
+# The matrix includes a 'NUMA Affinity' column; a value of -1 (or blank) means the kernel is
+# not advertising which NUMA node the GPU is local to, which hurts GPU<->CXL/DRAM memory
+# locality decisions and can silently degrade bandwidth-sensitive workloads.
+function gpu_numa_affinity() {
+  local FNAME=$1          # 'nvidia-smi topo -m' output
+  local total_gpus=0      # Number of GPU rows parsed
+  local bad_gpus=0        # GPUs with -1 or blank NUMA affinity
+  local col=0             # Column index of the 'NUMA Affinity' field
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Treat a present-but-empty or driver-error file as SKIPPED
+  if ! ${GREP} -qE "^GPU[0-9]" "${FNAME}"; then
+    rule_result SKIPPED "'${FNAME}' contained no GPU topology rows (nvidia-smi unavailable or driver error)."
+    return
+  fi
+
+  # Locate the 'NUMA Affinity' header column, then read that field from each GPU row.
+  while read -r line; do
+    info_msg "${line}" 2
+  done <<< "$(${AWK} '
+    # Header row: find which whitespace-separated field holds "NUMA Affinity"
+    /NUMA Affinity/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "NUMA" && $(i+1) == "Affinity") { ncol = i; break }
+      }
+      next
+    }
+    /^GPU[0-9]/ {
+      total++
+      val = ""
+      if (ncol > 0 && ncol <= NF) val = $ncol
+      if (val == "" || val == "-1") {
+        bad++
+        print $1 " NUMA Affinity: " (val == "" ? "(blank)" : val) " - no NUMA node exposed"
+      } else {
+        print $1 " NUMA Affinity: node " val
+      }
+    }
+  ' "${FNAME}")"
+
+  total_gpus=$(${AWK} '/^GPU[0-9]/ {c++} END {print c+0}' "${FNAME}")
+  bad_gpus=$(${AWK} '
+    /NUMA Affinity/ {
+      for (i = 1; i <= NF; i++) if ($i == "NUMA" && $(i+1) == "Affinity") { ncol = i; break }
+      next
+    }
+    /^GPU[0-9]/ {
+      val = (ncol > 0 && ncol <= NF) ? $ncol : ""
+      if (val == "" || val == "-1") c++
+    }
+    END { print c+0 }
+  ' "${FNAME}")
+
+  if (( total_gpus == 0 )); then
+    rule_result SKIPPED "No GPU rows found in '${FNAME}'."
+    return
+  fi
+
+  if (( bad_gpus >= 1 )); then
+    rule_result WARNING "${bad_gpus}/${total_gpus} GPU(s) report no NUMA affinity (-1/blank). The kernel is not advertising GPU<->NUMA locality, which hurts GPU-to-CXL/DRAM memory placement. See the per-GPU mapping above."
+    return
+  fi
+
+  rule_result INFO "All ${total_gpus} GPU(s) report a valid NUMA affinity. See the GPU-to-node mapping above."
+}
+
+# Call the main function
+gpu_numa_affinity "${OUTPUT_PATH}/nvidia-smi_topo_-m"
+
+set +x

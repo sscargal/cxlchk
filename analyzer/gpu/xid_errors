@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_XID_ERRORS_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_XID_ERRORS_="Loaded"
+
+# Detect NVIDIA Xid errors in the kernel log. An Xid is a GPU hardware/driver fault; some are
+# fatal (GPU fell off the bus, ECC/row-remap, GSP failures) and invalidate any GPU results.
+function gpu_xid_errors() {
+  local FNAME=$1        # dmesg -T
+  local count=0         # Number of Xid lines
+  local fatal=""        # Non-empty if a known-fatal Xid is present
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  count=$(${GREP} -E "NVRM: Xid" ${FNAME} | ${GREP} -c "")
+  if [[ ${count} -eq 0 ]]; then
+    rule_result PASSED "No NVIDIA Xid GPU errors found in the kernel log (since last boot)."
+    return
+  fi
+
+  # Extract Xid numbers and check for known-fatal ones.
+  # 48/63/64 = ECC / row-remap, 62/119 = GSP, 74 = NVLink, 79 = GPU fell off the bus.
+  local nums
+  nums=$(${GREP} -oE "Xid.*: [0-9]+" ${FNAME} | ${GREP} -oE "[0-9]+$")
+  while read -r n; do
+    [[ -z ${n} ]] && continue
+    case "${n}" in
+      48|62|63|64|74|79|119) fatal="yes" ;;
+    esac
+  done <<< "${nums}"
+
+  if [[ -n ${fatal} ]]; then
+    rule_result CRITICAL "${count} NVIDIA Xid GPU error(s) in the kernel log, including a known-fatal Xid (ECC/row-remap, GSP, NVLink, or GPU-off-the-bus). GPU results are unreliable - inspect 'NVRM: Xid' lines in dmesg."
+  else
+    rule_result WARNING "${count} NVIDIA Xid GPU error(s) found in the kernel log. Investigate the 'NVRM: Xid' lines in dmesg; recurring Xids indicate a faulting GPU."
+  fi
+}
+
+# Call the main function
+gpu_xid_errors "${OUTPUT_PATH}/dmesg_-T"
+
+set +x

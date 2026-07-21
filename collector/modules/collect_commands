@@ -14,12 +14,34 @@ function collect_cmds() {
     "free -m"
     "lscpu"
     "lspci"
+    "lspci -vv"
+    "lspci -tvvv"
     "lsmem"
     "lsmem -o RANGE,SIZE,STATE,REMOVABLE,ZONES,NODE,BLOCK"
     "lsmem -a -o RANGE,SIZE,STATE,REMOVABLE,ZONES,NODE,BLOCK"
     "lsmod"
     "numactl -H"
+    "numactl --help"
+    "numactl --version"
     "mount -v"
+    "uname -a"
+    "ls -l /sys/bus/cxl/devices/"
+    "grep -r . /sys/kernel/mm/numa/"
+    "grep -r . /sys/devices/virtual/memory_tiering/"
+    "grep -r . /sys/kernel/mm/mempolicy/weighted_interleave/"
+    "grep -rs . /sys/devices/system/edac/mc/ --include=ce_count --include=ue_count --include=dimm_label --include=dimm_ce_count --include=dimm_ue_count"
+    "grep -rs . /sys/devices/system/cpu/cpufreq/ --include=scaling_governor --include=scaling_driver --include=boost"
+    "grep -rs . /sys/devices/system/cpu/intel_pstate/"
+    "grep -rs . /sys/devices/system/cpu/cpu0/cpuidle/ --include=name --include=latency --include=disable"
+    "grep -rs . /sys/class/powercap/ --include=constraint_0_power_limit_uw --include=constraint_0_max_power_uw --include=name"
+    "cat /sys/devices/system/cpu/offline"
+    "cat /sys/devices/system/cpu/smt/control"
+    "find /sys/kernel/iommu_groups/ -maxdepth 2 -type l"
+    "rdmsr -a 0x1a4"
+    "nvidia-smi topo -m"
+    "nvidia-smi -q"
+    "/usr/local/cuda/gds/tools/gdscheck -p"
+    "nvidia-smi --query-gpu=index,pci.bus_id,pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current --format=csv,noheader"
   )
 
   # Initialize the progress bar
@@ -36,6 +58,7 @@ function collect_cmds() {
     # Replace spaces in the command and agrs to be used as the output file name
     OFNAME="${cmd}"
     OFNAME="${OFNAME// /_}" # Use the Bash string replace feature rather than calling sed or awk
+    OFNAME="${OFNAME//\//_}" # Replace '/' too, since some commands take path arguments
     CMD_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}"
     CMD_ERR_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}.err"
     # Run the command with arguments

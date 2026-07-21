@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_HUGETLB_POOL_}" ]; then
+  return
+fi
+_MODULE_CHECK_HUGETLB_POOL_="Loaded"
+
+# Report the static hugetlb pool from /proc/meminfo. A reserved pool is pinned
+# and unmovable; if it lands on a CXL node it prevents migration/demotion, and
+# a fully consumed pool starves further hugepage allocations.
+function linux_hugetlb_pool() {
+  local FNAME=$1
+
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  local total free rsvd
+  total=$(${AWK} '/^HugePages_Total:/ {print $2; exit}' "${FNAME}")
+  free=$(${AWK} '/^HugePages_Free:/ {print $2; exit}' "${FNAME}")
+  rsvd=$(${AWK} '/^HugePages_Rsvd:/ {print $2; exit}' "${FNAME}")
+
+  if [[ -z ${total} ]]; then
+    rule_result SKIPPED "No 'HugePages_Total' entry found in '${FNAME}'"
+    return
+  fi
+  [[ -z ${free} ]] && free=0
+  [[ -z ${rsvd} ]] && rsvd=0
+
+  if [[ ${total} -eq 0 ]]; then
+    rule_result PASSED "No static hugetlb pool reserved (HugePages_Total=0)."
+    return
+  fi
+
+  info_msg "HugePages_Total=${total}, HugePages_Free=${free}, HugePages_Rsvd=${rsvd}" 2
+
+  if [[ ${free} -eq 0 ]]; then
+    rule_result WARNING "The static hugetlb pool is fully consumed (HugePages_Free=0). Further hugepage allocations will fail."
+  else
+    rule_result INFO "A static hugetlb pool of ${total} pages is reserved (unmovable if backed by a CXL node)."
+  fi
+}
+
+linux_hugetlb_pool "${OUTPUT_PATH}/meminfo"
+
+set +x

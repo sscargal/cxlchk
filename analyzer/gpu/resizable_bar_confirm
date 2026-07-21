@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_REBAR_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_REBAR_="Loaded"
+
+# Confirm, from the authoritative 'lspci -vv' BAR sizes, whether Resizable BAR (and the BIOS
+# 'Above 4G Decoding' option it depends on) is enabled for each NVIDIA GPU. Within each NVIDIA
+# device record the prefetchable 64-bit BAR1 ('Region 1') is inspected: a small aperture
+# (< 1024 MiB) means the full framebuffer is not CPU-visible and ReBAR/Above-4G is likely
+# disabled, which limits GDS/P2P DMA performance. This corroborates the gds_installed heuristic
+# with the real hardware value.
+function gpu_resizable_bar_confirm() {
+  local FNAME=$1          # 'lspci -vv' output
+  local total_gpus=0      # NVIDIA GPUs with a parseable Region 1
+  local small_gpus=0      # GPUs whose BAR1 is below 1024 MiB
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # AWK program (shared by the detail pass and the count passes) that, statefully within each
+  # NVIDIA device record, extracts Region 1's size and normalizes it to MiB.
+  local prog='
+    function to_mib(s,   unit, num) {
+      unit = substr(s, length(s), 1)
+      num = s; gsub(/[KMGT]/, "", num)
+      if (unit == "T") return num * 1024 * 1024
+      if (unit == "G") return num * 1024
+      if (unit == "M") return num + 0
+      if (unit == "K") return num / 1024
+      return num / 1048576   # no suffix => bytes
+    }
+    /^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]/ { innv = ($0 ~ /NVIDIA/) ? 1 : 0; hdr = $1; next }
+    innv && /Region 1:/ && /64-bit, prefetchable/ {
+      if (match($0, /size=[0-9]+[KMGT]?/)) {
+        s = substr($0, RSTART + 5, RLENGTH - 5)
+        mib = to_mib(s)
+        emit(hdr, mib)
+      }
+    }
+  '
+
+  # Detail pass
+  while read -r line; do
+    info_msg "${line}" 2
+  done <<< "$(${AWK} "function emit(h, m){printf \"GPU %s BAR1 = %d MiB%s\n\", h, m, (m < 1024 ? \"  (small - ReBAR/Above-4G likely disabled)\" : \"\")} ${prog}" "${FNAME}")"
+
+  total_gpus=$(${AWK} "function emit(h, m){c++} ${prog} END{print c+0}" "${FNAME}")
+  small_gpus=$(${AWK} "function emit(h, m){if (m < 1024) c++} ${prog} END{print c+0}" "${FNAME}")
+
+  if (( total_gpus == 0 )); then
+    rule_result SKIPPED "No NVIDIA GPU with a prefetchable 64-bit Region 1 (BAR1) found in '${FNAME}'."
+    return
+  fi
+
+  if (( small_gpus >= 1 )); then
+    rule_result WARNING "${small_gpus}/${total_gpus} NVIDIA GPU(s) report a BAR1 aperture below 1024 MiB. Resizable BAR / 'Above 4G Decoding' is likely not enabled in the BIOS, limiting GDS/P2P DMA performance. See per-GPU sizes above."
+    return
+  fi
+
+  rule_result PASSED "All ${total_gpus} NVIDIA GPU(s) report a large BAR1 aperture (>= 1024 MiB), consistent with Resizable BAR / Above-4G Decoding being enabled."
+}
+
+# Call the main function
+gpu_resizable_bar_confirm "${OUTPUT_PATH}/lspci_-vv"
+
+set +x

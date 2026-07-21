@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CPU_MITIGATIONS_}" ]; then
+  return
+fi
+_MODULE_CHECK_CPU_MITIGATIONS_="Loaded"
+
+# Summarise CPU speculative-execution vulnerability mitigations. Mitigations can
+# cost performance; disabling them ('mitigations=off') trades security for speed.
+# This rule reports the posture so it is a conscious, documented choice.
+function linux_cpu_mitigations() {
+  local LSCPU=$1        # lscpu output (has 'Vulnerability <name>:' lines)
+  local CMDLINE=$2      # /proc/cmdline
+  local vulns=""        # Vulnerability lines from lscpu
+
+  # Exit the function with a SKIPPED message if lscpu is unavailable
+  if [[ ! -f ${LSCPU} ]] ; then
+    rule_result SKIPPED "Could not process '${LSCPU}'. File not found"
+    return
+  fi
+
+  vulns=$(${GREP} '^Vulnerability ' "${LSCPU}")
+
+  if [[ -z ${vulns} ]]; then
+    rule_result INFO "No 'Vulnerability' lines reported by lscpu in '${LSCPU}'; kernel may not expose vulnerability status."
+    return
+  fi
+
+  # Emit each vulnerability line, and tally the posture categories
+  local total=0 mitigated=0 notaffected=0 vulnerable=0
+  local line
+  while IFS= read -r line; do
+    [[ -z ${line} ]] && continue
+    total=$((total+1))
+    if echo "${line}" | ${GREP} -q 'Mitigation'; then
+      mitigated=$((mitigated+1))
+      info_msg "${line}" 2   # only surface the actionable (mitigated) lines
+    elif echo "${line}" | ${GREP} -q 'Vulnerable'; then
+      vulnerable=$((vulnerable+1))
+      info_msg "${line}" 2   # and any that are still vulnerable
+    elif echo "${line}" | ${GREP} -q 'Not affected'; then
+      notaffected=$((notaffected+1))
+    fi
+  done <<< "${vulns}"
+
+  # Check the kernel command line for a global mitigations override
+  if [[ -f ${CMDLINE} ]] && ${GREP} -q 'mitigations=off' "${CMDLINE}"; then
+    rule_result WARNING "'mitigations=off' is set on the kernel command line: all optional CPU vulnerability mitigations are DISABLED. This improves performance but is a deliberate security trade-off - confirm it is intended for this host. (${total} vulnerabilities: ${mitigated} mitigated, ${notaffected} not affected, ${vulnerable} vulnerable.)"
+  else
+    rule_result INFO "CPU vulnerability posture: ${total} tracked, ${mitigated} with active 'Mitigation', ${notaffected} 'Not affected', ${vulnerable} 'Vulnerable' (see above). Mitigations can reduce performance; note this when comparing CXL benchmark results across hosts."
+  fi
+}
+
+# Call the main function
+linux_cpu_mitigations "${OUTPUT_PATH}/lscpu" "${OUTPUT_PATH}/cmdline"
+
+set +x

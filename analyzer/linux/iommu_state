@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_IOMMU_STATE_}" ]; then
+  return
+fi
+_MODULE_CHECK_IOMMU_STATE_="Loaded"
+
+# Report the IOMMU domain mode, which affects DMA to CXL memory and GPUs (GPUDirect Storage /
+# P2P). Passthrough (iommu=pt) keeps isolation with near-native DMA throughput; Translated mode
+# adds per-descriptor translation overhead; disabled removes isolation for device DMA.
+function linux_iommu_state() {
+  local FNAME=$1        # /proc/cmdline
+  local DMESG=$2        # dmesg -T (authoritative 'Default domain type' line)
+  local domain=""       # Passthrough | Translated (from dmesg)
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Prefer the authoritative dmesg line, e.g.:
+  #   iommu: Default domain type: Passthrough (set via kernel command line)
+  if [[ -f ${DMESG} ]]; then
+    domain=$(${GREP} -E "iommu: Default domain type:" ${DMESG} | ${GREP} -oE "Passthrough|Translated" | ${GREP} -m1 "")
+  fi
+
+  # Fall back to the kernel command line
+  if [[ -z ${domain} ]]; then
+    if ${GREP} -qE "iommu=pt|intel_iommu=pt" ${FNAME}; then
+      domain="Passthrough"
+    elif ${GREP} -qE "intel_iommu=on|amd_iommu=on|iommu=on" ${FNAME}; then
+      domain="Translated"
+    elif ${GREP} -qE "intel_iommu=off|amd_iommu=off|iommu=off" ${FNAME}; then
+      domain="Off"
+    fi
+  fi
+
+  case "${domain}" in
+    Passthrough)
+      rule_result PASSED "IOMMU is in Passthrough mode (iommu=pt): device DMA (CXL, GPUDirect) runs at near-native throughput with isolation retained."
+      ;;
+    Translated)
+      rule_result WARNING "IOMMU is in Translated mode: every DMA descriptor is translated, adding overhead on the GPU/CXL DMA path. Consider 'iommu=pt' for memory/GPU-DMA workloads."
+      ;;
+    Off)
+      rule_result INFO "IOMMU is disabled: no DMA translation overhead, but also no DMA isolation for devices."
+      ;;
+    *)
+      rule_result INFO "Could not determine IOMMU domain mode from cmdline or dmesg."
+      ;;
+  esac
+}
+
+# Call the main function
+linux_iommu_state "${OUTPUT_PATH}/cmdline" "${OUTPUT_PATH}/dmesg_-T"
+
+set +x

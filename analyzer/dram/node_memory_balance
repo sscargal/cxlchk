@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_DRAM_NODE_BALANCE_}" ]; then
+  return
+fi
+_MODULE_CHECK_DRAM_NODE_BALANCE_="Loaded"
+
+# Report per-NUMA-node memory utilization from 'numactl -H'. A CPU-less node is
+# treated as the CXL tier. This is a point-in-time snapshot, so it leans
+# informational and only warns on a stark imbalance between the DRAM and CXL
+# tiers.
+function dram_node_memory_balance() {
+  local FNAME=$1
+
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Emit "<node> <hascpu:0|1> <size_mb> <free_mb>" for each node, in order.
+  local nodes
+  mapfile -t nodes < <(${AWK} '
+    /^node [0-9]+ cpus:/ { n=$2; cpu[n]=(NF>3)?1:0; if (!(n in seen)) { order[++c]=n; seen[n]=1 } }
+    /^node [0-9]+ size:/ { n=$2; size[n]=$4 }
+    /^node [0-9]+ free:/ { n=$2; free[n]=$4 }
+    END { for (i=1; i<=c; i++) { n=order[i]; print n, cpu[n]+0, size[n]+0, free[n]+0 } }
+  ' "${FNAME}")
+
+  if [[ ${#nodes[@]} -eq 0 ]]; then
+    rule_result SKIPPED "No NUMA node information found in '${FNAME}'"
+    return
+  fi
+
+  local dram_high=0 dram_low=0 cxl_high=0 cxl_low=0 have_cxl=0
+  local node hascpu size free used_pct kind
+  local line
+  for line in "${nodes[@]}"; do
+    read -r node hascpu size free <<< "${line}"
+    if [[ ${size} -gt 0 ]]; then
+      used_pct=$(( (size - free) * 100 / size ))
+    else
+      used_pct=0
+    fi
+
+    if [[ ${hascpu} -eq 0 ]]; then
+      kind="CXL (CPU-less)"
+      have_cxl=1
+      [[ ${used_pct} -gt 90 ]] && cxl_high=1
+      [[ ${used_pct} -lt 10 ]] && cxl_low=1
+    else
+      kind="DRAM"
+      [[ ${used_pct} -gt 90 ]] && dram_high=1
+      [[ ${used_pct} -lt 10 ]] && dram_low=1
+    fi
+
+    info_msg "node ${node} [${kind}]: ${free} MB free of ${size} MB (${used_pct}% used)" 2
+  done
+
+  if [[ ${have_cxl} -eq 1 && ( ( ${dram_high} -eq 1 && ${cxl_low} -eq 1 ) || ( ${cxl_high} -eq 1 && ${dram_low} -eq 1 ) ) ]]; then
+    rule_result WARNING "NUMA memory usage is heavily skewed between the DRAM and CXL tiers at this snapshot. Review the tiering/placement policy."
+  else
+    rule_result INFO "Reported per-node memory balance (point-in-time snapshot)."
+  fi
+}
+
+dram_node_memory_balance "${OUTPUT_PATH}/numactl_-H"
+
+set +x

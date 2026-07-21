@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GDS_INSTALLED_}" ]; then
+  return
+fi
+_MODULE_CHECK_GDS_INSTALLED_="Loaded"
+
+# Check whether NVIDIA GPUDirect Storage (GDS) is installed and correctly configured:
+# - GDS is installed and reports a release version
+# - every GPU reports 'supports GDS'
+# - every GPU's BAR1 aperture is large enough to indicate Resizable BAR (Above 4G Decoding)
+#   is enabled (heuristic: >= 4096 MiB; legacy non-ReBAR apertures are historically much
+#   smaller than this)
+# - surface gdscheck's own IOMMU-mode caveat, if present
+function gpu_gds_installed() {
+  local FNAME=$1          # File name to process ('gdscheck -p' output)
+  local ERR_STATE=""      # Used for error reporting
+  local gds_version=""    # GDS release version reported by gdscheck
+  local total_gpus=0      # Number of 'GPU index' lines found
+  local supported_gpus=0  # Number of GPUs whose line contains 'supports GDS'
+  local bar1=""           # A single GPU's BAR1 size (MiB), used while looping
+  local small_bar1=""     # Non-empty if any GPU's BAR1 is below the Resizable BAR heuristic
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. NVIDIA GPUDirect Storage (GDS) does not appear to be installed ('gdscheck' not found)."
+    return
+  fi
+
+  gds_version=$(${AWK} -F: '/GDS release version/{gsub(/^ +| +$/,"",$2); print $2}' ${FNAME})
+  if [[ -z ${gds_version} ]]; then
+    rule_result FAILED "'gdscheck' output did not report a GDS release version. GDS may not be installed or configured correctly."
+    return
+  fi
+  info_msg "GDS release version: ${gds_version}" 2
+
+  total_gpus=$(${GREP} -cE "^ ?GPU index" ${FNAME})
+  if [[ ${total_gpus} -eq 0 ]]; then
+    rule_result FAILED "GDS (${gds_version}) is installed, but 'gdscheck' reported no GPUs."
+    return
+  fi
+
+  while read -r line; do
+    info_msg "${line}" 2
+  done <<< "$(${GREP} -E "^ ?GPU index" ${FNAME})"
+
+  supported_gpus=$(${GREP} -cE "^ ?GPU index.*supports GDS" ${FNAME})
+  if [[ ${supported_gpus} -lt ${total_gpus} ]]; then
+    ERR_STATE="FAIL"
+  fi
+
+  # Check each GPU's BAR1 size against the Resizable BAR heuristic threshold
+  while read -r bar1; do
+    [[ -z ${bar1} ]] && continue
+    if (( bar1 < 4096 )); then
+      small_bar1="yes"
+    fi
+  done <<< "$(${GREP} -oE "bar size \(MiB\):[0-9]+" ${FNAME} | ${GREP} -oE "[0-9]+")"
+
+  if [[ -n ${small_bar1} ]]; then
+    if [[ -z ${ERR_STATE} ]]; then
+      ERR_STATE="WARN"
+    fi
+    info_msg "One or more GPUs report a BAR1 aperture below 4096 MiB - Resizable BAR (Above 4G Decoding) may not be enabled in the BIOS, which will limit GDS/P2P DMA performance." 2
+  fi
+
+  # Surface gdscheck's own IOMMU-mode compatibility caveat, if present
+  if ${GREP} -q "GDS is not guaranteed to work" ${FNAME}; then
+    if [[ -z ${ERR_STATE} ]]; then
+      ERR_STATE="WARN"
+    fi
+    info_msg "$(${GREP} "GDS is not guaranteed to work" ${FNAME})" 2
+  fi
+
+  case "${ERR_STATE}" in
+    FAIL)
+      rule_result FAILED "GDS (${gds_version}) is installed, but only ${supported_gpus}/${total_gpus} GPU(s) support it."
+      ;;
+    WARN)
+      rule_result WARNING "GDS (${gds_version}) is installed and all ${total_gpus} GPU(s) support it, but see the warnings above."
+      ;;
+    *)
+      rule_result PASSED "GDS (${gds_version}) is installed and correctly configured on all ${total_gpus} GPU(s)."
+      ;;
+  esac
+}
+
+# Call the main function
+gpu_gds_installed "${OUTPUT_PATH}/_usr_local_cuda_gds_tools_gdscheck_-p"
+
+set +x

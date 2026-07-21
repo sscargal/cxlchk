@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_HDM_COVERAGE_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_HDM_COVERAGE_="Loaded"
+
+# Cross-check the total CXL region capacity ('cxl list -R', sum of region sizes)
+# against the size of the CXL NUMA node reported by 'numactl -H'. A CXL memory
+# node is a node with memory but no CPUs. If the region total and the NUMA node
+# size diverge significantly, some CXL capacity is stranded or mismatched -
+# meaning the host cannot actually allocate all the CXL memory the decoders
+# describe. Tolerant by design: unparseable numbers degrade to INFO.
+function cxl_hdm_decoder_coverage() {
+  local RFILE=$1          # 'cxl list -R' JSON (region sizes in decimal bytes)
+  local NUMA=$2           # 'numactl -H' text
+  local region_bytes=0    # Sum of region sizes (bytes)
+  local node_mb=0         # CXL NUMA node size in MB
+  local node_bytes=0      # CXL NUMA node size in bytes
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${RFILE} ]] ; then
+    rule_result SKIPPED "Could not process '${RFILE}'. File not found"
+    return
+  fi
+
+  # Sum region sizes (bytes)
+  region_bytes=$(${GREP} -oE "\"size\":[0-9]+" ${RFILE} | ${GREP} -oE "[0-9]+$" | ${AWK} 'BEGIN{s=0} {s+=$1} END{print s+0}')
+
+  if [[ ${region_bytes} -le 0 ]]; then
+    rule_result SKIPPED "No CXL region sizes found in '${RFILE}'."
+    return
+  fi
+
+  if [[ ! -f ${NUMA} ]]; then
+    rule_result SKIPPED "Could not process '${NUMA}'. Cannot identify the CXL NUMA node."
+    return
+  fi
+
+  # Identify the CXL NUMA node: a node with memory (size) but an empty cpus line.
+  # numactl -H lines look like:
+  #   node 2 cpus:
+  #   node 2 size: 262144 MB
+  node_mb=$(${AWK} '
+    /^node [0-9]+ cpus:/ {
+      n=$2;
+      # everything after "cpus:" - if empty, this node has no CPUs
+      hascpu[n] = (NF > 3) ? 1 : 0;
+    }
+    /^node [0-9]+ size:/ {
+      n=$2; sz[n]=$4;
+    }
+    END {
+      for (n in sz) {
+        if (hascpu[n]==0 && sz[n]+0 > 0) { print sz[n]; break }
+      }
+    }' ${NUMA})
+
+  if [[ -z ${node_mb} || ! ${node_mb} =~ ^[0-9]+$ ]]; then
+    rule_result INFO "Could not identify a CPU-less (CXL) NUMA node in '${NUMA}'; skipping coverage cross-check. Region total is $(${AWK} -v b=${region_bytes} 'BEGIN{printf "%.2f", b/1073741824}') GB."
+    return
+  fi
+
+  node_bytes=$(${AWK} -v m=${node_mb} 'BEGIN{printf "%d", m*1048576}')
+
+  # Compare with a 10% tolerance
+  local verdict
+  verdict=$(${AWK} -v r=${region_bytes} -v n=${node_bytes} 'BEGIN{
+    if (n<=0) { print "info"; exit }
+    d = r - n; if (d<0) d=-d;
+    if (d/n > 0.10) print "warn"; else print "ok";
+  }')
+
+  local rgb ngb
+  rgb=$(${AWK} -v b=${region_bytes} 'BEGIN{printf "%.2f", b/1073741824}')
+  ngb=$(${AWK} -v b=${node_bytes} 'BEGIN{printf "%.2f", b/1073741824}')
+
+  case "${verdict}" in
+    warn)
+      rule_result WARNING "CXL region capacity (${rgb} GB) and the CXL NUMA node size (${ngb} GB) differ by more than 10%. Some CXL capacity may be stranded or mismatched (not all decoder-described memory is allocatable)."
+      ;;
+    ok)
+      rule_result PASSED "CXL region capacity (${rgb} GB) matches the CXL NUMA node size (${ngb} GB) within tolerance."
+      ;;
+    *)
+      rule_result INFO "Could not compare CXL region capacity (${rgb} GB) with the NUMA node size; numbers unparseable."
+      ;;
+  esac
+}
+
+cxl_hdm_decoder_coverage "${OUTPUT_PATH}/cxl_list_-R" "${OUTPUT_PATH}/numactl_-H"
+
+set +x

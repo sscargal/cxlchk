@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_OFFLINE_CPUS_}" ]; then
+  return
+fi
+_MODULE_CHECK_OFFLINE_CPUS_="Loaded"
+
+# Report offline CPUs. The collector only writes this file when it is non-empty
+# (empty output is deleted), so its presence means some CPUs are offline. Offline
+# CPUs remove their cores/threads from the pool that can drive memory traffic,
+# reducing aggregate (including CXL) bandwidth.
+function linux_offline_cpus() {
+  local FNAME=$1        # /sys/devices/system/cpu/offline
+  local offline=""      # Offline CPU list
+
+  # The file is absent when there are no offline CPUs
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "no offline CPUs reported (or not collected)"
+    return
+  fi
+
+  offline=$(${SED} 's/^[[:space:]]*//;s/[[:space:]]*$//' "${FNAME}")
+
+  if [[ -z ${offline} ]]; then
+    rule_result SKIPPED "no offline CPUs reported (or not collected)"
+    return
+  fi
+
+  rule_result WARNING "Offline CPU(s) detected: '${offline}'. Offline CPUs remove their cores/threads from the pool that generates memory traffic, reducing aggregate memory bandwidth (including to CXL memory). Bring them online for maximum bandwidth."
+}
+
+# Call the main function
+linux_offline_cpus "${OUTPUT_PATH}/cat__sys_devices_system_cpu_offline"
+
+set +x

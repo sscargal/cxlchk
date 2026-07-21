@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_HARDWARE_PREFETCHERS_}" ]; then
+  return
+fi
+_MODULE_CHECK_HARDWARE_PREFETCHERS_="Loaded"
+
+# Report the state of the hardware prefetchers via MSR 0x1A4. The bits in this
+# MSR are prefetcher *disable* bits, so a value of 0 means all prefetchers are
+# enabled. Disabled prefetchers change streaming bandwidth to/from CXL memory.
+function linux_hardware_prefetchers() {
+  local FNAME=$1        # rdmsr -a 0x1a4 output (one hex value per CPU)
+  local val=""          # First MSR value
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  # (rdmsr/msr module may be unavailable)
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Take the first non-empty value reported
+  val=$(${GREP} -m1 -E '[0-9a-fA-F]' "${FNAME}" | ${AWK} '{print $1}')
+
+  if [[ -z ${val} ]]; then
+    rule_result SKIPPED "No MSR 0x1A4 value found in '${FNAME}'"
+    return
+  fi
+
+  if [[ "${val}" == "0" ]]; then
+    rule_result INFO "MSR 0x1A4 = 0x${val}: hardware prefetchers all ENABLED. Streaming access patterns benefit from prefetch; expect higher sequential CXL bandwidth."
+  else
+    rule_result INFO "MSR 0x1A4 = 0x${val} (non-zero): one or more hardware prefetchers are DISABLED (each set bit disables a prefetcher). This changes - typically lowers - streaming/sequential bandwidth to/from CXL memory. Confirm this matches your intended tuning."
+  fi
+}
+
+# Call the main function
+linux_hardware_prefetchers "${OUTPUT_PATH}/rdmsr_-a_0x1a4"
+
+set +x

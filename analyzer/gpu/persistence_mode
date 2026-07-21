@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_PERSISTENCE_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_PERSISTENCE_="Loaded"
+
+# Check GPU 'Persistence Mode' from 'nvidia-smi -q'. With persistence mode disabled the NVIDIA
+# driver unloads whenever no client is attached, so the next job pays a driver re-initialization
+# penalty (seconds of added latency, and ECC/clock state reset). For servers running CUDA/CXL
+# workloads this should be enabled (nvidia-smi -pm 1 or nvidia-persistenced).
+function gpu_persistence_mode() {
+  local FNAME=$1          # 'nvidia-smi -q' output
+  local total=0           # GPUs reporting a Persistence Mode value
+  local disabled=0        # GPUs with Persistence Mode = Disabled
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. nvidia-smi not available or no NVIDIA GPUs present."
+    return
+  fi
+
+  total=$(${GREP} -c "Persistence Mode" "${FNAME}")
+  if (( total == 0 )); then
+    rule_result SKIPPED "No 'Persistence Mode' entries in '${FNAME}' (nvidia-smi driver error)."
+    return
+  fi
+
+  disabled=$(${GREP} "Persistence Mode" "${FNAME}" | ${GREP} -c "Disabled")
+
+  while read -r line; do
+    info_msg "Persistence Mode: ${line}" 2
+  done <<< "$(${AWK} -F: '/Persistence Mode/{gsub(/^ +| +$/,"",$NF); print $NF}' "${FNAME}")"
+
+  if (( disabled >= 1 )); then
+    rule_result WARNING "Persistence Mode is Disabled on ${disabled}/${total} GPU(s). The driver will unload between jobs, adding re-initialization latency. Enable with 'nvidia-smi -pm 1' or run nvidia-persistenced."
+    return
+  fi
+
+  rule_result PASSED "Persistence Mode is Enabled on all ${total} GPU(s)."
+}
+
+# Call the main function
+gpu_persistence_mode "${OUTPUT_PATH}/nvidia-smi_-q"
+
+set +x

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_LINK_DEGRADED_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_LINK_DEGRADED_="Loaded"
+
+# Find CXL devices whose PCIe link trained at a lower speed/width than it is capable of
+function cxl_link_degraded() {
+  local FNAME=$1        # File name to process
+  local ERR_STATE=""    # Used for error reporting
+  local result=""	      # Used to handle the result from the grep command
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Extract the 'lspci -vv' block for each CXL device (from the 'CXL' line to the next blank
+  # line) and look for lspci's own '(downgraded)' annotation on the LnkSta: line.
+  res=$(${AWK} '/CXL/{f=1} f{print} /^$/{f=0}' ${FNAME} | ${GREP} -i "LnkSta:.*downgraded")
+  case "$?" in
+    0)
+      rule_result FAILED "One or more CXL devices have a PCIe link that trained at a lower speed/width than it is capable of (see 'lspci -vv')!"
+      ;;
+    1)
+      rule_result PASSED "No CXL devices were found with a degraded PCIe link speed/width."
+      ;;
+    *)
+      rule_result SKIPPED "Failed to process 'lspci -vv' looking for degraded CXL PCIe links!"
+      ;;
+  esac
+}
+
+# Call the main function
+cxl_link_degraded "${OUTPUT_PATH}/lspci_-vv"
+
+set +x

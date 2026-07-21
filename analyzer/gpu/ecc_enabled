@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_ECC_ENABLED_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_ECC_ENABLED_="Loaded"
+
+# Check the GPU ECC (Error Correcting Code) configuration and health from 'nvidia-smi -q':
+#   - 'Ecc Mode' -> 'Current' : any 'Disabled' is a data-integrity risk -> WARNING
+#   - 'ECC Errors' -> Volatile/Aggregate -> 'Uncorrectable' totals > 0, or a pending row-remap
+#     / page-blacklist, indicate memory faults -> CRITICAL
+#   - ECC enabled and zero uncorrectable errors -> PASSED
+# GPUs that do not support ECC (no 'Ecc Mode' section) are skipped.
+function gpu_ecc_enabled() {
+  local FNAME=$1          # 'nvidia-smi -q' output
+  local ecc_disabled=0    # Count of GPUs with Ecc Mode Current = Disabled
+  local ecc_present=0     # Count of 'Ecc Mode' sections seen
+  local uncorr_total=0    # Sum of Uncorrectable error counts
+  local pending_remap=0   # Pending row-remap / page-blacklist entries
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. nvidia-smi not available or no NVIDIA GPUs present."
+    return
+  fi
+
+  ecc_present=$(${GREP} -c "Ecc Mode" "${FNAME}")
+  if (( ecc_present == 0 )); then
+    rule_result SKIPPED "No 'Ecc Mode' section in '${FNAME}' - GPUs do not support ECC or nvidia-smi errored."
+    return
+  fi
+
+  # Ecc Mode -> Current : capture the first 'Current' after each 'Ecc Mode' header
+  while read -r line; do
+    info_msg "Ecc Mode Current: ${line}" 2
+  done <<< "$(${AWK} '/Ecc Mode/{f=1; next} f && /Current/{gsub(/^ +| +$/,"",$0); n=split($0,a,":"); v=a[n]; gsub(/^ +| +$/,"",v); print v; f=0}' "${FNAME}")"
+
+  ecc_disabled=$(${AWK} '/Ecc Mode/{f=1; next} f && /Current/{f=0; if ($0 ~ /Disabled/) c++} END{print c+0}' "${FNAME}")
+
+  # Uncorrectable error totals - anchor on the label, sum any numeric values
+  uncorr_total=$(${AWK} -F: '/Uncorrectable/{v=$NF; gsub(/[^0-9]/,"",v); if (v != "") s+=v} END{print s+0}' "${FNAME}")
+  if (( uncorr_total > 0 )); then
+    while read -r line; do
+      info_msg "${line}" 2
+    done <<< "$(${GREP} -E "Uncorrectable" "${FNAME}" | ${GREP} -vE ": 0$")"
+  fi
+
+  # Pending row remapping (Ampere+) or page blacklist (Volta) indicates faulted memory
+  pending_remap=$(${GREP} -icE "(Remapping Pending|Pending (Page )?(Retirement|Blacklist)|Pending[[:space:]]*:[[:space:]]*Yes)" "${FNAME}")
+  if (( pending_remap > 0 )); then
+    while read -r line; do
+      info_msg "${line}" 2
+    done <<< "$(${GREP} -iE "(Remapping Pending|Pending (Page )?(Retirement|Blacklist)|Pending[[:space:]]*:[[:space:]]*Yes)" "${FNAME}")"
+  fi
+
+  if (( uncorr_total > 0 || pending_remap > 0 )); then
+    rule_result CRITICAL "GPU memory faults detected: ${uncorr_total} uncorrectable ECC error(s) and ${pending_remap} pending row-remap/page-blacklist entry(ies). See details above - the affected GPU memory is unreliable."
+    return
+  fi
+
+  if (( ecc_disabled > 0 )); then
+    rule_result WARNING "ECC is Disabled on ${ecc_disabled} GPU(s). Uncorrectable memory errors will go undetected/uncorrected - a data-integrity risk for compute workloads. Enable with 'nvidia-smi -e 1' (reboot required)."
+    return
+  fi
+
+  rule_result PASSED "ECC is enabled on all ${ecc_present} ECC-capable GPU(s) with zero uncorrectable errors and no pending row-remap/blacklist."
+}
+
+# Call the main function
+gpu_ecc_enabled "${OUTPUT_PATH}/nvidia-smi_-q"
+
+set +x

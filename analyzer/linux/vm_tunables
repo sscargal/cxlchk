@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_VM_TUNABLES_}" ]; then
+  return
+fi
+_MODULE_CHECK_VM_TUNABLES_="Loaded"
+
+# Check vm.zone_reclaim_mode (and report min_free_kbytes / swappiness). A
+# non-zero zone_reclaim_mode forces premature local reclaim, defeating the
+# intended spilling of cold pages to the CXL memory tier.
+function linux_vm_tunables() {
+  local FNAME=$1        # zone_reclaim_mode
+  local FMINFREE=$2     # min_free_kbytes
+  local FSWAP=$3        # swappiness
+
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  local zrm=""
+  read -r zrm < "${FNAME}" 2>/dev/null
+  zrm=$(printf '%s' "${zrm}" | ${SED} -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+  local num='^[0-9]+$'
+  if [[ ! ${zrm} =~ ${num} ]]; then
+    rule_result SKIPPED "Could not parse zone_reclaim_mode value '${zrm}'"
+    return
+  fi
+
+  # Report supporting tunables when available
+  if [[ -f ${FMINFREE} ]]; then
+    local minfree=""
+    read -r minfree < "${FMINFREE}" 2>/dev/null
+    info_msg "vm.min_free_kbytes=${minfree}" 2
+  fi
+  if [[ -f ${FSWAP} ]]; then
+    local swappiness=""
+    read -r swappiness < "${FSWAP}" 2>/dev/null
+    info_msg "vm.swappiness=${swappiness}" 2
+  fi
+
+  if [[ ${zrm} -ne 0 ]]; then
+    rule_result WARNING "vm.zone_reclaim_mode=${zrm}. Premature local reclaim defeats spilling cold pages to the CXL tier; prefer 0."
+  else
+    rule_result PASSED "vm.zone_reclaim_mode=0 (allows spilling to the CXL tier)."
+  fi
+}
+
+linux_vm_tunables "${OUTPUT_PATH}/zone_reclaim_mode" "${OUTPUT_PATH}/min_free_kbytes" "${OUTPUT_PATH}/swappiness"
+
+set +x

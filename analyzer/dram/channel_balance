@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_DRAM_CHANNEL_BALANCE_}" ]; then
+  return
+fi
+_MODULE_CHECK_DRAM_CHANNEL_BALANCE_="Loaded"
+
+# Check DRAM channel population balance from dmidecode Type 17 (Memory Device)
+# entries. Mismatched DIMM sizes or an odd/asymmetric population caps the
+# aggregate DRAM bandwidth available to the tiered-memory configuration.
+function dram_channel_balance() {
+  local FNAME=$1
+
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Walk each Type 17 "Memory Device" block. Emit the Size of every populated
+  # DIMM (anchored on the leading tab + "Size:" to avoid "Volatile Size" etc).
+  local sizes
+  mapfile -t sizes < <(${AWK} 'BEGIN{RS="";FS="\n"} {
+    isdev=0; size="";
+    for (i=1; i<=NF; i++) {
+      if ($i == "Memory Device") isdev=1;
+      if ($i ~ /^\tSize: /) { size=$i; sub(/^\tSize: /,"",size); }
+    }
+    if (isdev && size != "" && size !~ /No Module Installed/) print size;
+  }' "${FNAME}")
+
+  local populated=${#sizes[@]}
+
+  if [[ ${populated} -eq 0 ]]; then
+    rule_result SKIPPED "No populated Memory Devices found in '${FNAME}'"
+    return
+  fi
+
+  # Determine the distinct set of populated DIMM sizes
+  local distinct_count distinct_list
+  distinct_count=$(printf '%s\n' "${sizes[@]}" | sort -u | ${GREP} -c '.')
+  distinct_list=$(printf '%s\n' "${sizes[@]}" | sort -u | ${AWK} '{printf "%s%s", sep, $0; sep=", "}')
+
+  info_msg "Populated DIMMs: ${populated}; distinct sizes: ${distinct_list}" 2
+
+  if [[ ${distinct_count} -eq 1 && $((populated % 2)) -eq 0 ]]; then
+    rule_result PASSED "DRAM channels are balanced (${populated} identical DIMMs)."
+  else
+    rule_result WARNING "DRAM channel imbalance detected (${populated} DIMMs, sizes: ${distinct_list}). This caps aggregate DRAM bandwidth."
+  fi
+}
+
+dram_channel_balance "${OUTPUT_PATH}/dmidecode"
+
+set +x

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_RAPL_POWER_CAP_}" ]; then
+  return
+fi
+_MODULE_CHECK_RAPL_POWER_CAP_="Loaded"
+
+# Compare the RAPL package power limit (constraint_0_power_limit_uw) against the
+# maximum/TDP (constraint_0_max_power_uw). A limit set below the max causes power
+# throttling under load, producing unstable/lower memory bandwidth.
+function linux_rapl_power_cap() {
+  local FNAME=$1        # File name to process
+  local capped=""       # Set when a package is capped below its max
+  local havevals=""     # Set when at least one usable limit/max pair is parsed
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Path components contain colons (e.g. 'intel-rapl:0'), so split on the LAST
+  # colon to separate the attribute path from its value. Emit one line per
+  # package domain: '<name> <limit_uw> <max_uw>'.
+  local pkgs
+  pkgs=$(${AWK} '
+    {
+      val = $0; sub(/^.*:/, "", val)          # value after last colon
+      key = $0; sub(/:[^:]*$/, "", key)       # attribute path
+      attr = key; sub(/^.*\//, "", attr)      # name | constraint_0_power_limit_uw | constraint_0_max_power_uw
+      dir  = key; sub(/\/[^\/]*$/, "", dir)   # domain directory
+      if (attr == "name")                          name[dir]  = val
+      else if (attr == "constraint_0_power_limit_uw") limit[dir] = val
+      else if (attr == "constraint_0_max_power_uw")   max[dir]   = val
+    }
+    END {
+      for (d in name)
+        if (name[d] ~ /package/)
+          print name[d], (limit[d] == "" ? "0" : limit[d]), (max[d] == "" ? "0" : max[d])
+    }' "${FNAME}" | sort)
+
+  if [[ -z ${pkgs} ]]; then
+    rule_result INFO "No RAPL 'package' power domain was found in '${FNAME}'. Unable to evaluate the package power cap."
+    return
+  fi
+
+  local pname plimit pmax
+  while read -r pname plimit pmax; do
+    [[ -z ${pname} ]] && continue
+    if ! [[ ${plimit} =~ ^[0-9]+$ ]] || ! [[ ${pmax} =~ ^[0-9]+$ ]] || [[ ${plimit} -eq 0 ]] || [[ ${pmax} -eq 0 ]]; then
+      info_msg "RAPL domain '${pname}': power limit or max is missing/zero (limit=${plimit} uW, max=${pmax} uW)" 2
+      continue
+    fi
+    havevals="yes"
+    if ${AWK} -v l="${plimit}" -v m="${pmax}" 'BEGIN{exit !(l < m)}'; then
+      capped="yes"
+      info_msg "RAPL domain '${pname}': power limit ${plimit} uW is BELOW max ${pmax} uW" 2
+    else
+      info_msg "RAPL domain '${pname}': power limit ${plimit} uW is at/above max ${pmax} uW" 2
+    fi
+  done <<< "${pkgs}"
+
+  if [[ -z ${havevals} ]]; then
+    rule_result INFO "RAPL package power limit/max values are missing or zero (see above); unable to evaluate throttling risk."
+  elif [[ -n ${capped} ]]; then
+    rule_result WARNING "One or more package RAPL power limits are set below the package maximum/TDP (see above). A power cap below TDP triggers throttling under load and yields unstable/lower memory bandwidth. Raise 'constraint_0_power_limit_uw' to the max for consistent CXL bandwidth."
+  else
+    rule_result PASSED "RAPL package power limit(s) are at or above the package maximum/TDP; no artificial power cap that would throttle memory bandwidth."
+  fi
+}
+
+# Call the main function
+linux_rapl_power_cap "${OUTPUT_PATH}/grep_-rs_.__sys_class_powercap__--include=constraint_0_power_limit_uw_--include=constraint_0_max_power_uw_--include=name"
+
+set +x

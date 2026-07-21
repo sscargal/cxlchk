@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_MEMDEV_HEALTH_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_MEMDEV_HEALTH_="Loaded"
+
+# Analyze CXL memory-device health from 'cxl list --memdevs --health'.
+# Boolean health flags are unquoted JSON literals (true/false); the summarized ext_* fields
+# are strings ("normal"/"warning"/"critical"). Matched by occurrence (grep -oE), the same
+# grep-the-JSON idiom used by cxl/interleave (no jq dependency).
+function cxl_memdev_health() {
+  local FNAME=$1        # 'cxl list --memdevs --health' JSON
+  local ndev=0          # Number of memdevs with a health object
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  ndev=$(${GREP} -oE "\"memdev\":" ${FNAME} | ${GREP} -c "")
+  if [[ ${ndev} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL memory devices found in '${FNAME}'. memdevs may not enumerate (e.g. cxl_mem not loaded, or RCH/restricted devices)."
+    return
+  fi
+
+  # CRITICAL-level indicators
+  local crit=""
+  if ${GREP} -qE "\"(hw_replacement_needed|media_not_ready|media_data_lost|media_persistence_lost|media_data_loss_imminent|media_persistence_loss_imminent)\":true" ${FNAME} \
+     || ${GREP} -qE "\"ext_[a-z_]+\":\"critical\"" ${FNAME}; then
+    crit="yes"
+  fi
+
+  # WARNING-level indicators
+  local warn=""
+  if ${GREP} -qE "\"(performance_degraded|maintenance_needed)\":true" ${FNAME} \
+     || ${GREP} -qE "\"ext_[a-z_]+\":\"warning\"" ${FNAME}; then
+    warn="yes"
+  fi
+
+  if [[ -n ${crit} ]]; then
+    rule_result CRITICAL "One or more of ${ndev} CXL memory device(s) report a CRITICAL health condition (hardware replacement needed, media not ready, or data/persistence loss). Inspect 'cxl list --memdevs --health'."
+  elif [[ -n ${warn} ]]; then
+    rule_result WARNING "One or more of ${ndev} CXL memory device(s) report a degraded/warning health condition (performance degraded, maintenance needed, or an ext_* field at 'warning'). Inspect 'cxl list --memdevs --health'."
+  else
+    rule_result PASSED "All ${ndev} CXL memory device(s) report healthy status."
+  fi
+}
+
+# Call the main function
+cxl_memdev_health "${OUTPUT_PATH}/cxl_list_--memdevs_--health"
+
+set +x

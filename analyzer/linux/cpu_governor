@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CPU_GOVERNOR_}" ]; then
+  return
+fi
+_MODULE_CHECK_CPU_GOVERNOR_="Loaded"
+
+# Check the CPUfreq scaling governor. A non-'performance' governor lets core
+# frequency ramp up/down, adding latency jitter that shows up as CXL latency
+# and bandwidth variance in benchmarks.
+function linux_cpu_governor() {
+  local FNAME=$1        # File name to process
+  local governors=""    # Distinct governor values
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Extract distinct scaling_governor values (lines look like '.../scaling_governor:performance')
+  governors=$(${GREP} 'scaling_governor:' "${FNAME}" | ${AWK} -F: '{print $NF}' | sort -u)
+
+  if [[ -z ${governors} ]]; then
+    rule_result SKIPPED "Failed to process '${FNAME}'. No 'scaling_governor' values found"
+    return
+  fi
+
+  # Collapse the distinct governors into a single comma-separated string for reporting
+  local gov_list
+  gov_list=$(echo ${governors} | ${SED} 's/ /, /g')
+
+  if [[ "${governors}" == "performance" ]]; then
+    rule_result PASSED "All CPUs use the 'performance' scaling governor. Core frequency is held high for consistent CXL latency/bandwidth."
+  else
+    rule_result WARNING "One or more CPUs use a non-'performance' scaling governor (found: ${gov_list}). Non-'performance' governors ramp frequency up/down, adding jitter that manifests as CXL latency variance. Set the 'performance' governor for reproducible measurements."
+  fi
+}
+
+# Call the main function
+linux_cpu_governor "${OUTPUT_PATH}/grep_-rs_.__sys_devices_system_cpu_cpufreq__--include=scaling_governor_--include=scaling_driver_--include=boost"
+
+set +x

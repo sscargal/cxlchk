@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GDS_MODULES_LOADED_}" ]; then
+  return
+fi
+_MODULE_CHECK_GDS_MODULES_LOADED_="Loaded"
+
+# Check the kernel modules GPUDirect Storage (GDS) and GPU P2P depend on. gpu/gds_installed
+# only parses gdscheck's self-report; this rule catches the common "GDS installed but the
+# nvidia_fs kernel driver isn't loaded" case, where GDS silently falls back to compatibility
+# (bounce-buffer) mode. Module names in lsmod use underscores (nvidia_fs, not nvidia-fs).
+function gpu_gds_modules_loaded() {
+  local FNAME=$1        # lsmod output
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # If there's no NVIDIA driver at all, GDS isn't applicable to this host
+  if ! ${GREP} -qE "^nvidia\b" ${FNAME}; then
+    rule_result SKIPPED "NVIDIA driver ('nvidia') not loaded - GDS module check not applicable."
+    return
+  fi
+
+  local has_fs="no" has_peermem="no"
+  ${GREP} -qE "^nvidia_fs\b" ${FNAME} && has_fs="yes"
+  ${GREP} -qE "^nvidia_peermem\b" ${FNAME} && has_peermem="yes"
+
+  if [[ ${has_fs} == "no" ]]; then
+    rule_result FAILED "The GDS kernel driver 'nvidia_fs' is NOT loaded. GPUDirect Storage will fall back to compatibility (CPU bounce-buffer) mode and is effectively non-functional. Load nvidia-fs (modprobe nvidia_fs)."
+  elif [[ ${has_peermem} == "no" ]]; then
+    rule_result WARNING "'nvidia_fs' is loaded but 'nvidia_peermem' is not. GPUDirect RDMA (NIC<->GPU) paths are unavailable; local-storage GDS still works."
+  else
+    rule_result PASSED "GDS kernel modules are loaded (nvidia_fs and nvidia_peermem)."
+  fi
+}
+
+# Call the main function
+gpu_gds_modules_loaded "${OUTPUT_PATH}/lsmod"
+
+set +x

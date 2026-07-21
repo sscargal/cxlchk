@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_SUBNUMA_CLUSTERING_}" ]; then
+  return
+fi
+_MODULE_CHECK_SUBNUMA_CLUSTERING_="Loaded"
+
+# Detect Sub-NUMA Clustering (SNC): more CPU-bearing NUMA nodes than physical sockets means
+# the extra NUMA nodes are sub-divisions of a package, not separate sockets.
+function linux_subnuma_clustering() {
+  local FNAME=$1        # File name to process
+  local ERR_STATE=""    # Used for error reporting
+  local sockets=""      # Physical socket count
+  local cpu_nodes=""    # Count of NUMA nodes that have CPUs assigned
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  sockets=$(${AWK} -F: '/^Socket\(s\):/{gsub(/ /,"",$2); print $2}' ${FNAME})
+  cpu_nodes=$(${GREP} -cE "^NUMA node[0-9]+ CPU\(s\):[[:space:]]*[0-9]" ${FNAME})
+
+  if [[ -z ${sockets} ]] || ! [[ ${sockets} =~ ^[0-9]+$ ]]; then
+    rule_result SKIPPED "Failed to process '${FNAME}'. Could not determine 'Socket(s)' count!"
+    return
+  fi
+
+  if [[ ${cpu_nodes} -gt ${sockets} ]]; then
+    rule_result INFO "Sub-NUMA Clustering (SNC) appears to be ENABLED: ${sockets} physical socket(s) but ${cpu_nodes} CPU-bearing NUMA node(s). These extra NUMA nodes are sub-divisions of a package (each with its own memory channels), NOT separate sockets. Cross-check 'numactl -H' node distances to confirm: same-package SNC clusters have a much lower distance than a real inter-socket hop."
+  else
+    rule_result PASSED "NUMA nodes align 1:1 with physical sockets (${sockets} socket(s), ${cpu_nodes} CPU-bearing NUMA node(s)). Sub-NUMA Clustering does not appear to be enabled."
+  fi
+}
+
+# Call the main function
+linux_subnuma_clustering "${OUTPUT_PATH}/lscpu"
+
+set +x

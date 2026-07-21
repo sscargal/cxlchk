@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_PCIE_LINK_DEGRADED_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_PCIE_LINK_DEGRADED_="Loaded"
+
+# Check whether any NVIDIA GPU's PCIe link is degraded.
+#
+# Two dimensions are treated differently on purpose:
+#   - WIDTH (current < max) does NOT change with GPU power state, so a reduced width is a
+#     reliable hardware fault (e.g. an x8 link where x16 is expected) -> FAILED.
+#   - SPEED (current gen < max gen) drops to Gen1 whenever an NVIDIA GPU is idle (power
+#     saving) and ramps back up under load, so a static snapshot cannot distinguish a
+#     genuinely stuck link from a merely idle one. Reported as INFO, and only escalated to
+#     WARNING when corroborated by PCIe bandwidth/AER events in dmesg.
+function gpu_pcie_link_degraded() {
+  local FNAME=$1          # nvidia-smi link CSV file
+  local DMESG=$2          # collected 'dmesg -T' file, used to corroborate speed degradation
+  local ERR_STATE=""      # Worst-case state seen: FAIL > WARN > INFO
+  local gpu_count=0       # Number of GPU rows parsed
+  local idx bus gen_max gen_cur width_max width_cur
+  local bdf               # PCI bus:dev.func with the domain stripped, for matching dmesg
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. nvidia-smi not available or no NVIDIA GPUs present."
+    return
+  fi
+
+  while IFS=',' read -r idx bus gen_max gen_cur width_max width_cur; do
+    # Trim surrounding whitespace from every CSV field
+    idx="${idx//[[:space:]]/}"
+    bus="${bus//[[:space:]]/}"
+    gen_max="${gen_max//[[:space:]]/}"
+    gen_cur="${gen_cur//[[:space:]]/}"
+    width_max="${width_max//[[:space:]]/}"
+    width_cur="${width_cur//[[:space:]]/}"
+
+    # Skip blank or malformed lines
+    [[ -z ${idx} ]] && continue
+    if ! [[ ${gen_max} =~ ^[0-9]+$ && ${gen_cur} =~ ^[0-9]+$ && ${width_max} =~ ^[0-9]+$ && ${width_cur} =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+
+    gpu_count=$((gpu_count+1))
+
+    # WIDTH: reliable hardware fault signal (does not change with power state)
+    if (( width_cur < width_max )); then
+      info_msg "GPU ${idx} (${bus}) PCIe link WIDTH is x${width_cur}, below the capable x${width_max} - genuine link degradation." 2
+      ERR_STATE="FAIL"
+    fi
+
+    # SPEED: idle GPUs downtrain to Gen1, so corroborate with dmesg before flagging
+    if (( gen_cur < gen_max )); then
+      bdf="${bus#*:}"   # Strip nvidia-smi's 8-digit domain (00000000:89:00.0 -> 89:00.0)
+      if [[ -f ${DMESG} ]] && ${GREP} -iE "${bdf}.*(limited by|Bandwidth|aer|link is down)" "${DMESG}" > /dev/null 2>&1; then
+        info_msg "GPU ${idx} (${bus}) PCIe link SPEED is Gen${gen_cur}, below the capable Gen${gen_max}, AND dmesg shows PCIe bandwidth/link events for this device - likely genuinely degraded." 2
+        if [[ ${ERR_STATE} != "FAIL" ]]; then
+          ERR_STATE="WARN"
+        fi
+      else
+        info_msg "GPU ${idx} (${bus}) PCIe link SPEED is Gen${gen_cur}, below the capable Gen${gen_max}. NVIDIA GPUs idle at Gen1 to save power, so this is likely benign - re-check under GPU load to confirm." 2
+        if [[ -z ${ERR_STATE} ]]; then
+          ERR_STATE="INFO"
+        fi
+      fi
+    fi
+  done < "${FNAME}"
+
+  if (( gpu_count == 0 )); then
+    rule_result FAILED "'${FNAME}' contained no parseable GPU link data."
+    return
+  fi
+
+  case "${ERR_STATE}" in
+    FAIL)
+      rule_result FAILED "One or more GPUs have a degraded PCIe link WIDTH. See details above. GPU results will be unreliable until resolved."
+      ;;
+    WARN)
+      rule_result WARNING "One or more GPUs show a reduced PCIe link speed corroborated by dmesg bandwidth/link events. See details above."
+      ;;
+    INFO)
+      rule_result INFO "All ${gpu_count} GPU(s) are at full PCIe width, but one or more report a link speed below their max (expected when idle). See details above; confirm under load."
+      ;;
+    *)
+      rule_result PASSED "All ${gpu_count} GPU(s) are running at their full PCIe link speed and width."
+      ;;
+  esac
+}
+
+# Call the main function
+gpu_pcie_link_degraded "${OUTPUT_PATH}/nvidia-smi_--query-gpu=index,pci.bus_id,pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current_--format=csv,noheader" "${OUTPUT_PATH}/dmesg_-T"
+
+set +x

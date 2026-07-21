@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_P2P_TOPOLOGY_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_P2P_TOPOLOGY_="Loaded"
+
+# Check the GPU-to-GPU interconnect quality in the 'nvidia-smi topo -m' matrix. A 'SYS' cell
+# between two GPUs means peer traffic must traverse the CPU/SMP interconnect (QPI/UPI), which
+# is the slowest path and is often where P2P is unavailable altogether. NVLink (NV#) and
+# on-switch PCIe paths (PIX/PXB/PHB) are preferred. Reported as INFO (advisory placement
+# guidance) rather than an error.
+function gpu_p2p_topology() {
+  local FNAME=$1          # 'nvidia-smi topo -m' output
+  local sys_pairs=0       # GPU-GPU cells routed via SYS (SMP interconnect)
+  local total_pairs=0     # GPU-GPU cells inspected (excluding self 'X')
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Treat a present-but-empty or driver-error file as SKIPPED
+  if ! ${GREP} -qE "^GPU[0-9]" "${FNAME}"; then
+    rule_result SKIPPED "'${FNAME}' contained no GPU topology rows (nvidia-smi unavailable or driver error)."
+    return
+  fi
+
+  # Only inspect legend-token cells (X|SYS|NODE|PHB|PXB|PIX|NV#); this naturally excludes the
+  # CPU Affinity / NUMA Affinity / GPU NUMA ID columns whose values are numbers or ranges.
+  sys_pairs=$(${AWK} '
+    /^GPU[0-9]/ {
+      for (i = 2; i <= NF; i++) {
+        if ($i == "SYS") c++
+      }
+    }
+    END { print c+0 }
+  ' "${FNAME}")
+
+  total_pairs=$(${AWK} '
+    /^GPU[0-9]/ {
+      for (i = 2; i <= NF; i++) {
+        if ($i ~ /^(SYS|NODE|PHB|PXB|PIX|NV[0-9]+)$/) c++
+      }
+    }
+    END { print c+0 }
+  ' "${FNAME}")
+
+  # Emit the per-GPU matrix rows as detail
+  while read -r line; do
+    info_msg "${line}" 2
+  done <<< "$(${GREP} -E "^GPU[0-9]" "${FNAME}")"
+
+  if (( total_pairs == 0 )); then
+    rule_result SKIPPED "No GPU-to-GPU interconnect cells found in '${FNAME}' (single GPU or unparseable matrix)."
+    return
+  fi
+
+  if (( sys_pairs >= 1 )); then
+    rule_result INFO "${sys_pairs} GPU-to-GPU path(s) route via SYS (CPU/SMP interconnect) - the slowest P2P path, and often where P2P is disabled. For P2P/collective-heavy workloads, place peer GPUs under a common PCIe switch or NVLink. See the matrix above."
+    return
+  fi
+
+  rule_result PASSED "All GPU-to-GPU paths use NVLink (NV#) or on-switch PCIe (PIX/PXB/PHB); none traverse the SMP interconnect (SYS)."
+}
+
+# Call the main function
+gpu_p2p_topology "${OUTPUT_PATH}/nvidia-smi_topo_-m"
+
+set +x

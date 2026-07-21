@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_DECODER_COMMITTED_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_DECODER_COMMITTED_="Loaded"
+
+# Check that CXL ports/HDM decoders are enabled and committed, using the full
+# hierarchy from 'cxl list -vvv'. Ports and decoders both carry a "state" field
+# ("commit"/"disabled"); a decoder maps a device's capacity into the host physical
+# address space and until it is committed, the range it describes is not usable
+# memory, while a disabled port means that host bridge's CXL link is down. Any
+# non-committed object therefore means CXL capacity the kernel cannot hand out.
+# (Root decoders carry no "state" field and are not counted here.)
+function cxl_decoder_committed() {
+  local FNAME=$1          # 'cxl list -vvv' JSON
+  local total_state=0     # Number of port/decoder objects reporting a state
+  local committed=0       # Number in the 'commit' state
+  local disabled=0        # Number in the 'disabled' state
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  total_state=$(${GREP} -oE "\"state\":\"" ${FNAME} | ${GREP} -c "")
+  if [[ ${total_state} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL port/decoder state information found in '${FNAME}'."
+    return
+  fi
+
+  committed=$(${GREP} -oE "\"state\":\"commit\"" ${FNAME} | ${GREP} -c "")
+  disabled=$(${GREP} -oE "\"state\":\"disabled\"" ${FNAME} | ${GREP} -c "")
+
+  if [[ ${committed} -lt ${total_state} ]]; then
+    rule_result WARNING "Only ${committed}/${total_state} CXL port/decoder object(s) are committed (${disabled} disabled). Disabled ports mean a host bridge's CXL link is down and uncommitted decoders describe address ranges that are not yet usable memory - CXL capacity is unavailable to workloads."
+  else
+    rule_result PASSED "All ${total_state} CXL port/decoder object(s) are committed."
+  fi
+}
+
+cxl_decoder_committed "${OUTPUT_PATH}/cxl_list_-vvv"
+
+set +x

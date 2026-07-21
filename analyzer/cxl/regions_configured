@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_REGIONS_CONFIGURED_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_REGIONS_CONFIGURED_="Loaded"
+
+# Confirm at least one CXL region has been configured/committed
+function cxl_regions_configured() {
+  local FNAME=$1        # File name to process
+  local ERR_STATE=""    # Used for error reporting
+  local result=""	      # Used to handle the result from the grep command
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Find a 'region' entry in the `cxl list -R` output
+  res=$(${GREP} '"region' ${FNAME})
+  case "$?" in
+    0)
+      rule_result PASSED "One or more CXL regions are configured."
+      ;;
+    1)
+      rule_result FAILED "No CXL regions are configured. CXL memory capacity is not usable by the OS!"
+      ;;
+    *)
+      rule_result SKIPPED "Failed to process 'cxl list -R' looking for configured regions!"
+      ;;
+  esac
+}
+
+# Call the main function
+cxl_regions_configured "${OUTPUT_PATH}/cxl_list_-R"
+
+set +x

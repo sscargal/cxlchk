@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_HOST_MODE_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_HOST_MODE_="Loaded"
+
+# Check the CXL host hierarchy mode. Modern CXL platforms should present a
+# Virtual Host (VH) hierarchy; a Restricted CXL Host (RCH / RCD) topology is a
+# legacy/degraded enumeration that limits the kernel's ability to manage the
+# device (and to build cross-device interleave sets). A hierarchy that is a mix
+# of VH and RCH is a firmware/BIOS misconfiguration worth flagging. This rule is
+# scoped to host mode only and deliberately does not evaluate interleaving.
+function cxl_host_mode() {
+  local DMESG=$1          # 'dmesg -T' file
+  local CXLV=$2           # 'cxl list -vvv' JSON file
+  local have_data=0       # Whether any CXL data source is present
+
+  # Both sources missing -> nothing to evaluate
+  if [[ ! -f ${DMESG} && ! -f ${CXLV} ]]; then
+    rule_result SKIPPED "Could not process '${DMESG}' or '${CXLV}'. File not found"
+    return
+  fi
+
+  # Mixed VH/RCH hierarchy (logged by the kernel)
+  if [[ -f ${DMESG} ]] && ${GREP} -q "mixed Virtual Host and Restricted CXL Host" ${DMESG}; then
+    info_msg "$(${GREP} -m1 "mixed Virtual Host and Restricted CXL Host" ${DMESG})" 2
+    rule_result WARNING "The CXL hierarchy is a mix of Virtual Host (VH) and Restricted CXL Host (RCH) mode. This is typically a firmware/BIOS misconfiguration; bring all devices up in VH mode for full kernel management."
+    return
+  fi
+
+  # Restricted CXL Host / RCD topology present
+  if { [[ -f ${CXLV} ]] && ${GREP} -qE "RCD|Restricted CXL" ${CXLV}; } \
+     || { [[ -f ${DMESG} ]] && ${GREP} -qE "RCD|Restricted CXL" ${DMESG}; }; then
+    rule_result WARNING "A Restricted CXL Host (RCH/RCD) topology was detected. This is a legacy/degraded enumeration that limits kernel management of the CXL device. Prefer a Virtual Host (VH) hierarchy."
+    return
+  fi
+
+  # Determine whether any CXL data is actually present
+  if [[ -f ${CXLV} ]] && ${GREP} -qE "\"memdev\":|\"decoder\":" ${CXLV}; then
+    have_data=1
+  fi
+  if [[ -f ${DMESG} ]] && ${GREP} -qE "cxl" ${DMESG}; then
+    have_data=1
+  fi
+
+  if [[ ${have_data} -eq 1 ]]; then
+    rule_result PASSED "The CXL hierarchy appears to be Virtual Host (VH) mode - no RCH/RCD or mixed-mode indicators found."
+  else
+    rule_result INFO "No CXL host-mode indicators found. CXL may not be present on this host."
+  fi
+}
+
+cxl_host_mode "${OUTPUT_PATH}/dmesg_-T" "${OUTPUT_PATH}/cxl_list_-vvv"
+
+set +x

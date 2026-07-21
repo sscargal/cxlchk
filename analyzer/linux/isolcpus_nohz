@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_ISOLCPUS_NOHZ_}" ]; then
+  return
+fi
+_MODULE_CHECK_ISOLCPUS_NOHZ_="Loaded"
+
+# Report CPU-isolation kernel command-line parameters (isolcpus, nohz_full,
+# rcu_nocbs). Isolated/tickless cores reduce OS jitter, which is relevant when
+# running latency-sensitive CXL benchmarks on dedicated cores.
+function linux_isolcpus_nohz() {
+  local FNAME=$1        # /proc/cmdline
+  local found=""        # Accumulated isolation settings
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  local param val
+  for param in isolcpus nohz_full rcu_nocbs; do
+    # Match the parameter as a whole token and capture its value
+    val=$(${GREP} -oE "(^|[[:space:]])${param}=[^[:space:]]+" "${FNAME}" | ${SED} 's/^[[:space:]]*//' | head -n1)
+    if [[ -n ${val} ]]; then
+      found+="${val} "
+      info_msg "CPU isolation parameter present: '${val}'" 2
+    fi
+  done
+
+  if [[ -n ${found} ]]; then
+    rule_result INFO "CPU isolation is configured on the kernel command line (${found% }). Isolated/tickless cores reduce OS-induced jitter, which helps reproducibility of latency-sensitive CXL benchmarks; ensure your benchmark threads are pinned to the isolated cores."
+  else
+    rule_result INFO "No CPU isolation configured (no isolcpus/nohz_full/rcu_nocbs on the kernel command line). OS scheduler jitter may add variance to latency-sensitive CXL measurements."
+  fi
+}
+
+# Call the main function
+linux_isolcpus_nohz "${OUTPUT_PATH}/cmdline"
+
+set +x

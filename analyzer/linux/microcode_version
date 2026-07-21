@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_MICROCODE_VERSION_}" ]; then
+  return
+fi
+_MODULE_CHECK_MICROCODE_VERSION_="Loaded"
+
+# Report the loaded CPU microcode revision. Microcode updates can affect memory
+# controller behaviour and CXL support/errata; there is no external database to
+# check against here, so this is informational only.
+function linux_microcode_version() {
+  local FNAME=$1        # /proc/cpuinfo
+  local revision=""     # microcode revision string
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Grab the first 'microcode' line's value (all CPUs normally match)
+  revision=$(${GREP} -m1 '^microcode' "${FNAME}" | ${AWK} '{print $NF}')
+
+  if [[ -z ${revision} ]]; then
+    rule_result SKIPPED "No 'microcode' line found in '${FNAME}'"
+    return
+  fi
+
+  rule_result INFO "Loaded CPU microcode revision is '${revision}'. Microcode can affect memory-controller and CXL errata behaviour; ensure it matches the vendor's recommended revision for your platform (not verifiable here)."
+}
+
+# Call the main function
+linux_microcode_version "${OUTPUT_PATH}/cpuinfo"
+
+set +x

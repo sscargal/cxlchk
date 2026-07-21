@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_MEMDEV_PARTITION_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_MEMDEV_PARTITION_="Loaded"
+
+# Report how each CXL memory device is partitioned between volatile (ram_size)
+# and persistent (pmem_size) capacity, from 'cxl list --memdevs --health'. Only
+# volatile capacity joins the system-ram (kmem) NUMA node; pmem capacity is
+# exposed as a DAX/persistent device and will NOT show up as usable NUMA memory
+# unless explicitly reconfigured. Severity is INFO because the intended
+# deployment (volatile vs persistent) is not something this tool can know.
+function cxl_memdev_partition() {
+  local FNAME=$1          # 'cxl list --memdevs --health' JSON
+  local ndev=0            # Number of memdevs
+  local ram_total=0       # Sum of ram_size (bytes)
+  local pmem_total=0      # Sum of pmem_size (bytes)
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  ndev=$(${GREP} -oE "\"memdev\":\"mem[0-9]+\"" ${FNAME} | ${GREP} -c "")
+  if [[ ${ndev} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL memory devices found in '${FNAME}'. memdevs may not enumerate."
+    return
+  fi
+
+  ram_total=$(${GREP} -oE "\"ram_size\":[0-9]+" ${FNAME} | ${GREP} -oE "[0-9]+$" | ${AWK} 'BEGIN{s=0} {s+=$1} END{print s+0}')
+  pmem_total=$(${GREP} -oE "\"pmem_size\":[0-9]+" ${FNAME} | ${GREP} -oE "[0-9]+$" | ${AWK} 'BEGIN{s=0} {s+=$1} END{print s+0}')
+
+  local rgb pgb
+  rgb=$(${AWK} -v b=${ram_total} 'BEGIN{printf "%.2f", b/1073741824}')
+  pgb=$(${AWK} -v b=${pmem_total} 'BEGIN{printf "%.2f", b/1073741824}')
+
+  if [[ ${pmem_total} -gt 0 ]]; then
+    rule_result INFO "CXL capacity across ${ndev} device(s) is partitioned as ${rgb} GB volatile (ram) and ${pgb} GB persistent (pmem). The pmem capacity is exposed as a DAX/persistent device and will NOT join the volatile NUMA node unless reconfigured."
+  else
+    rule_result PASSED "All ${ndev} CXL memory device(s) are fully volatile (${rgb} GB ram, 0 pmem)."
+  fi
+}
+
+cxl_memdev_partition "${OUTPUT_PATH}/cxl_list_--memdevs_--health"
+
+set +x

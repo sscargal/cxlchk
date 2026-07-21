@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_INTERLEAVE_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_INTERLEAVE_="Loaded"
+
+# Check whether CXL memory capacity is hardware-interleaved across multiple targets/AICs.
+#
+# When multiple CXL devices (AICs) are stitched into one NUMA node as separate address
+# ranges instead of a hardware interleave set, every root decoder reports
+# 'interleave_ways: 1'. A single large allocation then lands on one AIC and gets one AIC's
+# bandwidth, not the aggregate. A common root cause is the AICs coming up in mixed
+# Virtual Host / Restricted CXL Host mode, which the kernel logs and which prevents it from
+# building a cross-AIC interleave set.
+function cxl_interleave() {
+  local FNAME=$1          # 'cxl list -MDT' JSON file
+  local DMESG=$2          # collected 'dmesg -T' file, used to corroborate the root cause
+  local ndec=0            # Number of decoders (interleave_ways lines)
+  local max_ways=0        # Maximum interleave_ways value seen
+  local mixed=0           # Count of dmesg 'mixed VH/RCH' messages
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Count occurrences (not lines) so both pretty-printed and compact JSON are handled
+  ndec=$(${GREP} -oE "\"interleave_ways\":[0-9]+" ${FNAME} | ${GREP} -c "")
+  if [[ ${ndec} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL decoders found in '${FNAME}'. CXL may not be present or configured."
+    return
+  fi
+
+  # Largest interleave_ways value across all decoders
+  max_ways=$(${GREP} -oE "\"interleave_ways\":[0-9]+" ${FNAME} | ${GREP} -oE "[0-9]+$" | ${AWK} 'BEGIN{m=0} {if($1>m)m=$1} END{print m}')
+
+  # Corroborating root-cause signal: AICs came up in mixed VH/RCH mode
+  if [[ -f ${DMESG} ]]; then
+    mixed=$(${GREP} -c "mixed Virtual Host and Restricted CXL Host" "${DMESG}")
+  fi
+
+  if [[ ${max_ways} -ge 2 ]]; then
+    rule_result PASSED "CXL capacity is interleaved (interleave_ways up to ${max_ways}) across multiple targets."
+    return
+  fi
+
+  # max_ways == 1: nothing is interleaved
+  if [[ ${mixed} -gt 0 ]]; then
+    info_msg "$(${GREP} -m1 "mixed Virtual Host and Restricted CXL Host" "${DMESG}")" 2
+    rule_result WARNING "CXL memory is NOT interleaved: all ${ndec} decoder(s) report interleave_ways=1, and dmesg reports a mixed Virtual Host / Restricted CXL Host hierarchy. The kernel could not build a hardware interleave set, so the multi-AIC NUMA node is separate address ranges - a single large allocation gets one AIC's bandwidth, not the aggregate."
+  elif [[ ${ndec} -ge 2 ]]; then
+    rule_result WARNING "CXL capacity is exposed as ${ndec} separate non-interleaved decoders (all interleave_ways=1). If these are multiple devices/AICs, their bandwidth is not aggregated - a single large allocation gets one device's bandwidth."
+  else
+    rule_result PASSED "A single CXL decoder is present - interleaving is not applicable."
+  fi
+}
+
+# Call the main function
+cxl_interleave "${OUTPUT_PATH}/cxl_list_-MDT" "${OUTPUT_PATH}/dmesg_-T"
+
+set +x

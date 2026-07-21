@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CPU_CSTATES_}" ]; then
+  return
+fi
+_MODULE_CHECK_CPU_CSTATES_="Loaded"
+
+# Report enabled CPU idle (C-)states and their exit latency. Deep C-states with
+# high exit latency inflate the effective load-to-use latency of CXL-attached
+# memory, because a core parked in a deep state must first wake up.
+function linux_cpu_cstates() {
+  local FNAME=$1        # File name to process
+  local deep=""         # Set when a deep (high-latency) state is enabled
+  local found=""        # Set when at least one enabled state is parsed
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Group name/latency/disable by state directory, then emit '<name> <latency>'
+  # for each enabled state (disable:0). Lines look like '.../state2/name:C6'.
+  local enabled
+  enabled=$(${AWK} -F: '
+    {
+      attr = $1; sub(/^.*\//, "", attr)
+      dir  = $1; sub(/\/[^\/]*$/, "", dir)
+      val  = $2
+      if (attr == "name")         name[dir] = val
+      else if (attr == "latency") lat[dir]  = val
+      else if (attr == "disable") dis[dir]  = val
+    }
+    END {
+      for (d in name)
+        if (dis[d] == "0")
+          print name[d], (lat[d] == "" ? "0" : lat[d])
+    }' "${FNAME}" | sort)
+
+  if [[ -z ${enabled} ]]; then
+    rule_result SKIPPED "Failed to process '${FNAME}'. No CPU idle state data found"
+    return
+  fi
+
+  local sname slat
+  while read -r sname slat; do
+    [[ -z ${sname} ]] && continue
+    found="yes"
+    info_msg "Idle state '${sname}' is ENABLED (exit latency ${slat} us)" 2
+    if [[ ${slat} =~ ^[0-9]+$ ]] && [[ ${slat} -gt 100 ]]; then
+      deep="yes"
+    fi
+  done <<< "${enabled}"
+
+  if [[ -z ${found} ]]; then
+    rule_result PASSED "No enabled CPU idle states with significant exit latency were found."
+  elif [[ -n ${deep} ]]; then
+    rule_result INFO "One or more deep CPU idle states with exit latency > 100 us are enabled (see above). Deep C-states inflate CXL load-to-use latency when a core has to wake before servicing a memory request. Consider limiting the maximum C-state (e.g. 'intel_idle.max_cstate=' / 'processor.max_cstate=') for latency-sensitive CXL workloads."
+  else
+    rule_result PASSED "Enabled CPU idle states all have low exit latency (<= 100 us); CXL load-to-use latency should not be inflated by deep C-states."
+  fi
+}
+
+# Call the main function
+linux_cpu_cstates "${OUTPUT_PATH}/grep_-rs_.__sys_devices_system_cpu_cpu0_cpuidle__--include=name_--include=latency_--include=disable"
+
+set +x

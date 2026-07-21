@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_HYPERTHREADING_SMT_}" ]; then
+  return
+fi
+_MODULE_CHECK_HYPERTHREADING_SMT_="Loaded"
+
+# Report the SMT/Hyper-Threading topology. This is not a pass/fail concern, but
+# it matters for reproducible bandwidth measurement: sibling threads share core
+# resources, so thread placement changes achievable CXL bandwidth per core.
+function linux_hyperthreading_smt() {
+  local FNAME=$1        # lscpu output
+  local tpc=""          # Thread(s) per core
+  local cps=""          # Core(s) per socket
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  tpc=$(${AWK} -F: '/^Thread\(s\) per core:/{gsub(/ /,"",$2); print $2}' "${FNAME}")
+  cps=$(${AWK} -F: '/^Core\(s\) per socket:/{gsub(/ /,"",$2); print $2}' "${FNAME}")
+
+  if [[ -z ${tpc} ]] || ! [[ ${tpc} =~ ^[0-9]+$ ]]; then
+    rule_result SKIPPED "Could not determine 'Thread(s) per core' from '${FNAME}'"
+    return
+  fi
+
+  if [[ ${tpc} -gt 1 ]]; then
+    rule_result INFO "SMT/Hyper-Threading is ENABLED (${tpc} thread(s) per core, ${cps:-unknown} core(s) per socket). Sibling threads share core resources; pin benchmark threads deliberately for reproducible per-core CXL bandwidth measurements."
+  else
+    rule_result INFO "SMT/Hyper-Threading is DISABLED (1 thread per core, ${cps:-unknown} core(s) per socket). One thread per core simplifies reproducible CXL bandwidth measurement."
+  fi
+}
+
+# Call the main function
+linux_hyperthreading_smt "${OUTPUT_PATH}/lscpu"
+
+set +x

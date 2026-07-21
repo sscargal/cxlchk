@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_WEIGHTED_INTERLEAVE_KERNEL_}" ]; then
+  return
+fi
+_MODULE_CHECK_WEIGHTED_INTERLEAVE_KERNEL_="Loaded"
+
+# Report whether the kernel exposes the Weighted Interleave mempolicy (MPOL_WEIGHTED_INTERLEAVE,
+# Linux >= 6.9) via /sys/kernel/mm/mempolicy/weighted_interleave/, and whether the per-node
+# weights have been tuned away from the uniform default.
+#
+# Note: the weight table is global/system-wide, but a process must still opt in to the
+# MPOL_WEIGHTED_INTERLEAVE policy itself (via 'numactl --weighted-interleave' or libnuma's
+# set_mempolicy()/mbind()) - there is no kernel-wide default that applies it to all allocations.
+function linux_weighted_interleave_kernel() {
+  local FNAME=$1        # File name to process
+  local count=""        # Number of NUMA nodes with a weight entry
+  local nonuniform=""    # Non-empty if the weights differ across nodes
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Kernel weighted-interleave sysfs interface not present (requires Linux >= 6.9, or the feature is not compiled in)."
+    return
+  fi
+
+  count=$(${GREP} -c ":" ${FNAME})
+  nonuniform=$(${AWK} -F: '{ if (v=="") {v=$2} else if ($2!=v) {print "no"; exit} }' ${FNAME})
+
+  if [[ -z ${nonuniform} ]]; then
+    rule_result INFO "Kernel Weighted Interleave mempolicy is AVAILABLE across ${count} NUMA node(s), but all weights are still the uniform default. Tune /sys/kernel/mm/mempolicy/weighted_interleave/nodeN to match relative CXL/DRAM bandwidth. Note this is a global weight table, but each process must still opt in via 'numactl --weighted-interleave' or set_mempolicy()/mbind() - it is not applied automatically."
+  else
+    rule_result INFO "Kernel Weighted Interleave mempolicy is AVAILABLE and configured with custom per-node weights across ${count} NUMA node(s). Note this is a global weight table, but each process must still opt in via 'numactl --weighted-interleave' or set_mempolicy()/mbind() - it is not applied automatically."
+  fi
+}
+
+# Call the main function
+linux_weighted_interleave_kernel "${OUTPUT_PATH}/grep_-r_.__sys_kernel_mm_mempolicy_weighted_interleave_"
+
+set +x

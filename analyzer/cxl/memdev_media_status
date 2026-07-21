@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_MEMDEV_MEDIA_STATUS_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_MEMDEV_MEDIA_STATUS_="Loaded"
+
+# Check the media-status/durability signals of every CXL memory device from
+# 'cxl list --memdevs --health'. Persistent CXL memory relies on the device
+# flushing in-flight data on power loss; a lost/imminent-loss flag means data
+# may not survive a shutdown, and accumulated dirty (unclean) shutdowns hint at
+# recurring power/flush problems. On a CXL memory host this is a data-integrity
+# signal, not just a performance one.
+function cxl_memdev_media_status() {
+  local FNAME=$1          # 'cxl list --memdevs --health' JSON
+  local ndev=0            # Number of memdevs
+  local dirty_total=0     # Sum of dirty_shutdowns across all memdevs
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  ndev=$(${GREP} -oE "\"memdev\":\"mem[0-9]+\"" ${FNAME} | ${GREP} -c "")
+  if [[ ${ndev} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL memory devices found in '${FNAME}'. memdevs may not enumerate."
+    return
+  fi
+
+  # Sum dirty_shutdowns across all memdevs
+  dirty_total=$(${GREP} -oE "\"dirty_shutdowns\":[0-9]+" ${FNAME} | ${GREP} -oE "[0-9]+$" | ${AWK} 'BEGIN{s=0} {s+=$1} END{print s+0}')
+
+  # CRITICAL: media reported data loss on power loss / shutdown
+  local media_loss=""
+  if ${GREP} -qE "\"(media_powerloss_data_loss|media_shutdown_data_loss)\":true" ${FNAME}; then
+    media_loss="yes"
+  fi
+
+  # WARNING: persistence loss flags, or accumulated dirty shutdowns
+  local persist_loss=""
+  if ${GREP} -qE "\"media_[a-z_]*persistence_loss[a-z_]*\":true" ${FNAME}; then
+    persist_loss="yes"
+  fi
+
+  if [[ -n ${media_loss} ]]; then
+    rule_result CRITICAL "One or more of ${ndev} CXL memory device(s) report media data loss on power loss or shutdown (media_powerloss_data_loss / media_shutdown_data_loss). Persistent data may be lost. Inspect 'cxl list --memdevs --health'."
+  elif [[ ${dirty_total} -gt 0 || -n ${persist_loss} ]]; then
+    rule_result WARNING "CXL memory devices report ${dirty_total} accumulated dirty (unclean) shutdown(s)$( [[ -n ${persist_loss} ]] && printf ' and/or a media persistence-loss flag' ). This can indicate recurring power/flush problems affecting durability."
+  else
+    rule_result PASSED "All ${ndev} CXL memory device(s) report clean media status (no data/persistence loss flags, no dirty shutdowns)."
+  fi
+}
+
+cxl_memdev_media_status "${OUTPUT_PATH}/cxl_list_--memdevs_--health"
+
+set +x

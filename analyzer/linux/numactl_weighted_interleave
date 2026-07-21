@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_NUMACTL_WEIGHTED_INTERLEAVE_}" ]; then
+  return
+fi
+_MODULE_CHECK_NUMACTL_WEIGHTED_INTERLEAVE_="Loaded"
+
+# Report whether the installed numactl CLI supports --weighted-interleave/-w (added in
+# numactl v2.0.19). numactl doesn't recognize '--help', but it prints its full usage banner
+# to stderr in response, which is what gets checked here.
+function linux_numactl_weighted_interleave() {
+  local FNAME=$1          # File name to process (numactl --help stderr banner)
+  local VERFNAME=$2       # File name for 'numactl --version' output
+  local version=""        # Installed numactl version, if known
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. 'numactl' may not be installed."
+    return
+  fi
+
+  if [[ -f ${VERFNAME} ]]; then
+    read -r version < "${VERFNAME}"
+  fi
+
+  res=$(${GREP} -i "weighted-interleave" ${FNAME})
+  case "$?" in
+    0)
+      rule_result PASSED "Installed numactl (${version:-unknown version}) supports '--weighted-interleave'/'-w'."
+      ;;
+    1)
+      rule_result WARNING "Installed numactl (${version:-unknown version}) does NOT support '--weighted-interleave'/'-w'. Upgrade to numactl >= 2.0.19 to use this CLI feature for CXL-tiering-aware NUMA node weighting."
+      ;;
+    *)
+      rule_result SKIPPED "Failed to process '${FNAME}' looking for 'weighted-interleave' support!"
+      ;;
+  esac
+}
+
+# Call the main function
+linux_numactl_weighted_interleave "${OUTPUT_PATH}/numactl_--help.err" "${OUTPUT_PATH}/numactl_--version"
+
+set +x

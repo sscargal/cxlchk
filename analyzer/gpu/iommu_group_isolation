@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_IOMMU_GROUP_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_IOMMU_GROUP_="Loaded"
+
+# Report IOMMU group isolation from the /sys/kernel/iommu_groups symlink listing. Each device
+# maps to a group; a group with many devices means those devices are not individually isolated
+# (they must all be passed through together), which usually points to missing ACS support in a
+# bridge or a BIOS setting and can affect GPU P2P/pass-through. This is advisory (INFO), and
+# only a heavily populated group (> 4 devices) is raised to WARNING.
+function gpu_iommu_group_isolation() {
+  local FNAME=$1          # 'find /sys/kernel/iommu_groups -maxdepth 2 -type l' output
+  local group_count=0     # Distinct IOMMU groups
+  local dev_count=0       # Total device symlinks
+  local max_group=0       # Group id with the most devices
+  local max_devs=0        # Device count in the largest group
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found (IOMMU may be disabled)."
+    return
+  fi
+
+  # Treat a present-but-empty file as SKIPPED
+  if ! ${GREP} -qE "iommu_groups/[0-9]+/devices/" "${FNAME}"; then
+    rule_result SKIPPED "'${FNAME}' contained no IOMMU group device entries (IOMMU disabled or no groups)."
+    return
+  fi
+
+  group_count=$(${GREP} -oE "iommu_groups/[0-9]+/" "${FNAME}" | ${AWK} '!seen[$0]++' | ${GREP} -c .)
+  dev_count=$(${GREP} -cE "iommu_groups/[0-9]+/devices/" "${FNAME}")
+
+  # Devices per group, and the largest group
+  while read -r line; do
+    info_msg "IOMMU group ${line}" 2
+  done <<< "$(${AWK} '
+    match($0, /iommu_groups\/[0-9]+\//) {
+      g = substr($0, RSTART, RLENGTH)
+      gsub(/[^0-9]/, "", g)
+      n[g]++
+    }
+    END { for (g in n) print g ": " n[g] " device(s)" }
+  ' "${FNAME}" | ${AWK} -F: '{gsub(/[^0-9]/,"",$1); print $1"\t"$0}' | sort -n | cut -f2-)"
+
+  read -r max_group max_devs <<< "$(${AWK} '
+    match($0, /iommu_groups\/[0-9]+\//) {
+      g = substr($0, RSTART, RLENGTH)
+      gsub(/[^0-9]/, "", g)
+      n[g]++
+    }
+    END { mg=-1; md=0; for (g in n) if (n[g] > md) { md=n[g]; mg=g }; print mg, md }
+  ' "${FNAME}")"
+
+  if (( max_devs > 4 )); then
+    rule_result WARNING "IOMMU group ${max_group} contains ${max_devs} devices (across ${group_count} group(s), ${dev_count} device(s) total). Large groups mean poor per-device isolation - often a missing-ACS/BIOS issue that also affects GPU P2P/pass-through. See per-group counts above."
+    return
+  fi
+
+  rule_result INFO "Found ${group_count} IOMMU group(s) covering ${dev_count} device(s); the largest (group ${max_group}) holds ${max_devs} device(s). See per-group counts above."
+}
+
+# Call the main function
+gpu_iommu_group_isolation "${OUTPUT_PATH}/find__sys_kernel_iommu_groups__-maxdepth_2_-type_l"
+
+set +x

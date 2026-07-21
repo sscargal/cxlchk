@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_THROTTLE_BAR1_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_THROTTLE_BAR1_="Loaded"
+
+# Check for active GPU clock throttling and BAR1 pressure in 'nvidia-smi -q'.
+#   - 'Clocks Throttle Reasons' -> 'HW Thermal Slowdown' / 'HW Power Brake Slowdown' /
+#     'SW Power Cap' set to 'Active' means the GPU is being clamped right now, which destabilizes
+#     sustained throughput -> WARNING.
+#   - 'BAR1 Memory Usage' Used/Total > 0.9 means the CPU-visible aperture is nearly exhausted,
+#     which can throttle host<->GPU/CXL transfers -> INFO.
+function gpu_throttle_and_bar1_usage() {
+  local FNAME=$1          # 'nvidia-smi -q' output
+  local throttling=0      # Count of active HW/SW throttle reasons
+  local bar1_full=0       # Count of BAR1 sections above 90% used
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. nvidia-smi not available or no NVIDIA GPUs present."
+    return
+  fi
+
+  # Treat a present-but-empty / driver-error file as SKIPPED
+  if ! ${GREP} -qE "(Clocks (Throttle|Event) Reasons|BAR1 Memory Usage)" "${FNAME}"; then
+    rule_result SKIPPED "'${FNAME}' has no throttle-reason or BAR1 usage data (nvidia-smi driver error)."
+    return
+  fi
+
+  # Active throttle reasons. ':[[:space:]]*Active' matches ': Active' but not ': Not Active'.
+  throttling=$(${GREP} -cE "(HW Thermal Slowdown|HW Power Brake Slowdown|SW Power Cap):[[:space:]]*Active" "${FNAME}")
+  if (( throttling > 0 )); then
+    while read -r line; do
+      info_msg "Throttle: ${line}" 2
+    done <<< "$(${GREP} -E "(HW Thermal Slowdown|HW Power Brake Slowdown|SW Power Cap):[[:space:]]*Active" "${FNAME}")"
+  fi
+
+  # BAR1 Memory Usage: capture Total and Used (MiB) within each BAR1 section, report and flag
+  # any section where Used/Total > 0.9.
+  local prog='
+    /BAR1 Memory Usage/ { inb = 1; tot = 0; use = 0; next }
+    inb && /Total/ { v = $(NF-1); if (v ~ /^[0-9]+$/) tot = v }
+    inb && /Used/  { v = $(NF-1); if (v ~ /^[0-9]+$/) use = v }
+    inb && /Free/  {
+      inb = 0
+      emit(use, tot)
+    }
+  '
+  local bar1_detail
+  bar1_detail="$(${AWK} "function emit(u, t){ if (t > 0) printf \"Used %d MiB / Total %d MiB (%.0f%%)\n\", u, t, (u*100.0/t) }  ${prog}" "${FNAME}")"
+  if [[ -n ${bar1_detail} ]]; then
+    while read -r line; do
+      info_msg "BAR1 Memory Usage: ${line}" 2
+    done <<< "${bar1_detail}"
+  fi
+
+  bar1_full=$(${AWK} "function emit(u, t){ if (t > 0 && (u*1.0/t) > 0.9) c++ }  ${prog} END{print c+0}" "${FNAME}")
+
+  if (( throttling > 0 )); then
+    rule_result WARNING "${throttling} active GPU throttle reason(s) detected (HW thermal / HW power brake / SW power cap). Sustained GPU throughput will be unstable - check cooling and power/thermal limits. See details above."
+    return
+  fi
+
+  if (( bar1_full > 0 )); then
+    rule_result INFO "${bar1_full} GPU(s) have BAR1 usage above 90%. The CPU-visible aperture is nearly full, which can throttle host<->GPU/CXL transfers. See usage above."
+    return
+  fi
+
+  rule_result PASSED "No active GPU throttling and BAR1 usage is within normal limits."
+}
+
+# Call the main function
+gpu_throttle_and_bar1_usage "${OUTPUT_PATH}/nvidia-smi_-q"
+
+set +x

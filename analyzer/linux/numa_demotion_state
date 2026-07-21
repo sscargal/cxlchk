@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_NUMA_DEMOTION_STATE_}" ]; then
+  return
+fi
+_MODULE_CHECK_NUMA_DEMOTION_STATE_="Loaded"
+
+# Report whether NUMA demotion (DRAM -> CXL tiered memory reclaim) is enabled
+function linux_numa_demotion_state() {
+  local FNAME=$1        # File name to process
+  local ERR_STATE=""    # Used for error reporting
+  local line=""         # Matching line from the collected file
+  local value=""        # The demotion_enabled value (kernel version dependent: 0/1, true/false, Y/N)
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # Report the 'demotion_enabled' state from /sys/kernel/mm/numa/
+  line=$(${GREP} "demotion_enabled:" ${FNAME})
+  if [[ -z ${line} ]]; then
+    rule_result SKIPPED "No 'demotion_enabled' entry found. Kernel may not support NUMA memory tiering."
+    return
+  fi
+
+  value="${line#*demotion_enabled:}"
+  case "${value,,}" in
+    1|true|y|yes)
+      rule_result INFO "NUMA demotion is ENABLED. DRAM pages may be automatically demoted to CXL memory tiers under memory pressure."
+      ;;
+    0|false|n|no)
+      rule_result INFO "NUMA demotion is DISABLED. DRAM pages will not be automatically demoted to CXL memory tiers; confirm this is intentional."
+      ;;
+    *)
+      rule_result SKIPPED "Unrecognized 'demotion_enabled' value: '${value}'"
+      ;;
+  esac
+}
+
+# Call the main function
+linux_numa_demotion_state "${OUTPUT_PATH}/grep_-r_.__sys_kernel_mm_numa_"
+
+set +x

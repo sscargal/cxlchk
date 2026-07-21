@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_TURBO_BOOST_}" ]; then
+  return
+fi
+_MODULE_CHECK_TURBO_BOOST_="Loaded"
+
+# Check whether Turbo/Boost is enabled. With turbo disabled, cores are capped at
+# base frequency, which lowers the read bandwidth achievable to/from CXL memory.
+function linux_turbo_boost() {
+  local PSTATE=$1       # intel_pstate grep dump
+  local CPUFREQ=$2      # cpufreq grep dump (for the 'boost' knob)
+  local no_turbo=""     # intel_pstate no_turbo value
+  local status=""       # intel_pstate status value
+  local boost=""        # cpufreq boost value
+
+  # If neither source is present there is nothing to evaluate
+  if [[ ! -f ${PSTATE} ]] && [[ ! -f ${CPUFREQ} ]] ; then
+    rule_result SKIPPED "Could not process '${PSTATE}' or '${CPUFREQ}'. File(s) not found"
+    return
+  fi
+
+  if [[ -f ${PSTATE} ]]; then
+    no_turbo=$(${GREP} 'intel_pstate/no_turbo:' "${PSTATE}" | ${AWK} -F: '{print $NF}' | sort -u | head -n1)
+    status=$(${GREP} 'intel_pstate/status:' "${PSTATE}" | ${AWK} -F: '{print $NF}' | sort -u | head -n1)
+  fi
+
+  if [[ -f ${CPUFREQ} ]]; then
+    boost=$(${GREP} '/boost:' "${CPUFREQ}" | ${AWK} -F: '{print $NF}' | sort -u | head -n1)
+  fi
+
+  if [[ "${no_turbo}" == "1" ]] || [[ "${boost}" == "0" ]]; then
+    rule_result WARNING "Turbo/Boost appears to be DISABLED (intel_pstate no_turbo='${no_turbo:-n/a}', cpufreq boost='${boost:-n/a}'). Cores are capped at base frequency, which reduces the read bandwidth achievable to/from CXL memory. Enable turbo/boost for peak CXL bandwidth."
+  elif [[ -n ${status} ]] && [[ "${status}" != "active" ]]; then
+    rule_result INFO "The intel_pstate driver status is '${status}' (not 'active'). Turbo behaviour is governed by the acpi-cpufreq/passive path; verify boost is enabled (cpufreq boost='${boost:-n/a}') for peak CXL read bandwidth."
+  else
+    rule_result PASSED "Turbo/Boost is enabled (intel_pstate no_turbo='${no_turbo:-n/a}', status='${status:-n/a}', cpufreq boost='${boost:-n/a}'); cores can reach turbo frequencies for maximum CXL read bandwidth."
+  fi
+}
+
+# Call the main function
+linux_turbo_boost "${OUTPUT_PATH}/grep_-rs_.__sys_devices_system_cpu_intel_pstate_" "${OUTPUT_PATH}/grep_-rs_.__sys_devices_system_cpu_cpufreq__--include=scaling_governor_--include=scaling_driver_--include=boost"
+
+set +x

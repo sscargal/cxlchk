@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_MEMORY_AUTO_ONLINE_}" ]; then
+  return
+fi
+_MODULE_CHECK_MEMORY_AUTO_ONLINE_="Loaded"
+
+# Check /sys/devices/system/memory/auto_online_blocks. For a CPU-less CXL node
+# 'online_movable' is correct; anything else risks either offline CXL capacity
+# or unmovable kernel allocations landing on far memory.
+function linux_memory_auto_online() {
+  local FNAME=$1
+
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  local val=""
+  read -r val < "${FNAME}" 2>/dev/null
+  val=$(printf '%s' "${val}" | ${SED} -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+  case "${val}" in
+    online_movable)
+      rule_result PASSED "auto_online_blocks='online_movable' (correct for a CPU-less CXL node)."
+      ;;
+    offline)
+      rule_result WARNING "auto_online_blocks='offline'. CXL memory blocks may not auto-online (see the cxl/offline_mem_blocks check)."
+      ;;
+    online|online_kernel)
+      rule_result WARNING "auto_online_blocks='${val}'. This risks unmovable kernel allocations on far CXL memory; prefer 'online_movable'."
+      ;;
+    *)
+      rule_result INFO "auto_online_blocks='${val}' (unrecognized value)."
+      ;;
+  esac
+}
+
+linux_memory_auto_online "${OUTPUT_PATH}/auto_online_blocks"
+
+set +x
