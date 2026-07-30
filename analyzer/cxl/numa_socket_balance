@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_NUMA_SOCKET_BALANCE_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_NUMA_SOCKET_BALANCE_="Loaded"
+
+# On a multi-socket server every physical socket should have the same NUMA topology - the
+# same number of NUMA nodes, and the same split between CPU-bearing and CXL (CPU-less)
+# nodes - regardless of whether Sub-NUMA Clustering is enabled. If one socket has a CXL
+# node attached and another doesn't (or has fewer), memory requests from the
+# under-provisioned socket's CPUs are forced across the inter-socket interconnect
+# (UPI/xGMI/etc) to reach a CXL node hanging off a different socket, adding latency and
+# consuming interconnect bandwidth that other cross-socket traffic also needs.
+#
+# 'lscpu' alone cannot tell us which physical socket a NUMA node belongs to - it only
+# reports how many CPUs/NUMA nodes exist in total. 'lscpu -p=CPU,NODE,SOCKET' gives the
+# per-CPU CPU->NODE->SOCKET mapping needed to place every CPU-bearing NUMA node on its
+# socket. CXL nodes have no CPUs, so they can't appear in that mapping directly; instead,
+# each CXL node is attributed to whichever socket its 'numactl -H' node-distance is
+# smallest to (the socket it is physically wired closest to).
+function cxl_numa_socket_balance() {
+  local LSCPU_P=$1        # 'lscpu -p=CPU,NODE,SOCKET' CSV
+  local NUMA=$2           # 'numactl -H' text
+  local sockets=0         # Distinct physical socket count
+
+  if [[ ! -f ${LSCPU_P} ]] ; then
+    rule_result SKIPPED "Could not process '${LSCPU_P}'. File not found (requires a util-linux 'lscpu' that supports '-p=CPU,NODE,SOCKET')."
+    return
+  fi
+
+  if [[ ! -f ${NUMA} ]] ; then
+    rule_result SKIPPED "Could not process '${NUMA}'. File not found"
+    return
+  fi
+
+  sockets=$(${GREP} -v "^#" ${LSCPU_P} | ${AWK} -F, '{print $3}' | sort -u | ${GREP} -c "")
+
+  if [[ ${sockets} -eq 0 ]]; then
+    rule_result SKIPPED "Failed to process '${LSCPU_P}'. Could not determine the physical socket count!"
+    return
+  fi
+
+  if [[ ${sockets} -lt 2 ]]; then
+    rule_result INFO "Single-socket system (${sockets} socket): per-socket CXL/NUMA balance is not applicable."
+    return
+  fi
+
+  local awk_out
+  awk_out=$(${AWK} '
+    # --- File 1: lscpu -p=CPU,NODE,SOCKET (CSV, comments start with #) ---
+    FNR==NR {
+      if ($0 ~ /^#/) { next }
+      node=$2+0; sock=$3+0
+      if ((node in node_socket) && node_socket[node] != sock) { multisocket[node]=1 }
+      node_socket[node]=sock
+      next
+    }
+    # --- File 2: numactl -H (whitespace separated) ---
+    /^node [0-9]+ cpus:/ { n=$2+0; hascpu[n]=(NF>3)?1:0; next }
+    /^node [0-9]+ size:/ { n=$2+0; sz[n]=$4+0; next }
+    /^node distances:/   { indist=1; next }
+    indist && /^node[ \t]/ {
+      for (i=2; i<=NF; i++) { colnode[i-2]=$i+0 }
+      next
+    }
+    indist && /^[ \t]*[0-9]+:/ {
+      rn=$1+0
+      for (i=2; i<=NF; i++) { dist[rn, colnode[i-2]]=$i+0 }
+      next
+    }
+    END {
+      for (n in hascpu) {
+        if (hascpu[n]==1) { cpu_nodes[n]=1 }
+        else if (sz[n]>0) { cxl_nodes[n]=1 }
+      }
+
+      rawcxl=0
+      for (c in cxl_nodes) { rawcxl++ }
+      print "RAW_CXL_COUNT " rawcxl
+
+      for (n in multisocket) { print "MULTISOCKET_NODE " n }
+
+      # Attribute each CXL (CPU-less) node to the socket of its nearest CPU-bearing node
+      for (c in cxl_nodes) {
+        mind=-1
+        delete tiesocks
+        for (p in cpu_nodes) {
+          d=dist[c,p]
+          if (d=="") { continue }
+          if (mind==-1 || d<mind) { mind=d; delete tiesocks; tiesocks[node_socket[p]]=1 }
+          else if (d==mind) { tiesocks[node_socket[p]]=1 }
+        }
+        nts=0
+        for (ts in tiesocks) { nts++ }
+        if (mind==-1) { print "UNRESOLVED_CXL " c; continue }
+        if (nts>1) { print "AMBIGUOUS_CXL " c; continue }
+        for (ts in tiesocks) { msock=ts }
+        tally_total[msock]++
+        tally_cxl[msock]++
+      }
+
+      # Attribute each CPU-bearing node to its socket
+      for (p in cpu_nodes) {
+        s=node_socket[p]
+        tally_total[s]++
+        tally_cpu[s]++
+      }
+
+      for (s in tally_total) {
+        print "BALANCE " s " " (tally_total[s]+0) " " (tally_cpu[s]+0) " " (tally_cxl[s]+0)
+      }
+    }
+  ' FS=, "${LSCPU_P}" FS=" " "${NUMA}")
+
+  # A NUMA node whose CPUs map to more than one physical socket means NUMA nodes don't
+  # align with sockets at all (e.g. BIOS NUMA node interleaving / UMA mode) - there is no
+  # per-socket granularity to check.
+  if ${GREP} -q "^MULTISOCKET_NODE" <<< "${awk_out}"; then
+    rule_result INFO "One or more NUMA nodes span multiple physical sockets (e.g. NUMA node interleaving is enabled in the BIOS). Per-socket CXL/NUMA balance cannot be evaluated on this topology."
+    return
+  fi
+
+  local raw_cxl
+  raw_cxl=$(${GREP} "^RAW_CXL_COUNT" <<< "${awk_out}" | ${AWK} '{print $2}')
+
+  if [[ -z ${raw_cxl} || ${raw_cxl} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL NUMA node (CPU-less node with memory) found. CXL may not be present or configured."
+    return
+  fi
+
+  local balance_lines
+  balance_lines=$(${GREP} "^BALANCE" <<< "${awk_out}")
+
+  if [[ -z ${balance_lines} ]]; then
+    rule_result SKIPPED "Could not compute a per-socket NUMA node tally from '${LSCPU_P}'/'${NUMA}'."
+    return
+  fi
+
+  local nbal cxl_sum=0 total_str="" cpu_str="" first_triplet="" mismatched=0
+  local sock total cpu cxl
+  nbal=$(${GREP} -c "" <<< "${balance_lines}")
+
+  while read -r _ sock total cpu cxl; do
+    [[ -z ${sock} ]] && continue
+    cxl_sum=$(( cxl_sum + cxl ))
+    total_str+="socket ${sock}: ${total} node(s) (${cpu} cpu, ${cxl} cxl); "
+    local triplet="${total} ${cpu} ${cxl}"
+    if [[ -z ${first_triplet} ]]; then
+      first_triplet="${triplet}"
+    elif [[ ${triplet} != "${first_triplet}" ]]; then
+      mismatched=1
+    fi
+  done <<< "${balance_lines}"
+
+  if [[ ${cxl_sum} -eq 0 ]]; then
+    rule_result SKIPPED "Found ${raw_cxl} CXL NUMA node(s) in '${NUMA}' but could not attribute any of them to a socket - 'numactl -H' is missing or has an unparseable node-distance table."
+    return
+  fi
+
+  local note=""
+  local n_ambiguous n_unresolved
+  n_ambiguous=$(${GREP} -c "^AMBIGUOUS_CXL" <<< "${awk_out}")
+  n_unresolved=$(${GREP} -c "^UNRESOLVED_CXL" <<< "${awk_out}")
+  if [[ ${n_ambiguous} -gt 0 ]]; then
+    note+=" Note: ${n_ambiguous} CXL node(s) were equidistant from more than one socket and excluded from this tally."
+  fi
+  if [[ ${n_unresolved} -gt 0 ]]; then
+    note+=" Note: ${n_unresolved} CXL node(s) had no distance data and were excluded from this tally."
+  fi
+
+  if [[ ${mismatched} -eq 1 || ${nbal} -lt ${sockets} ]]; then
+    rule_result FAILED "Imbalanced NUMA topology across ${sockets} CPU sockets: ${total_str}Each socket should have the same number and type (CPU/CXL) of NUMA nodes; an under-provisioned socket must reach CXL memory across the inter-socket interconnect.${note}"
+  else
+    rule_result PASSED "NUMA topology is balanced across ${sockets} CPU sockets: ${total_str}${note}"
+  fi
+}
+
+# Call the main function
+cxl_numa_socket_balance "${OUTPUT_PATH}/lscpu_-p=CPU,NODE,SOCKET" "${OUTPUT_PATH}/numactl_-H"
+
+set +x
