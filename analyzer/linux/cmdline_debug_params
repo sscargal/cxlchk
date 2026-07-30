@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CMDLINE_DEBUG_PARAMS_}" ]; then
+  return
+fi
+_MODULE_CHECK_CMDLINE_DEBUG_PARAMS_="Loaded"
+
+# Flag kernel cmdline parameters and loaded modules that synthesize or restrict memory
+# topology for testing (efi_fake_mem, memmap=...!..., mem=, acpi=off, numa=off, cxl_test/
+# cxl_mock/nfit_test). Any of these left on a host by accident means the rest of this
+# tool's output - and 'numactl -H'/'cxl list' themselves - may describe a fabricated or
+# artificially restricted topology rather than the real hardware.
+function linux_cmdline_debug_params() {
+  local CMDLINE=$1        # /proc/cmdline
+  local MODULES=$2        # /proc/modules
+
+  if [[ ! -f ${CMDLINE} ]] ; then
+    rule_result SKIPPED "Could not process '${CMDLINE}'. File not found"
+    return
+  fi
+
+  local cmdline=""
+  read -r cmdline < "${CMDLINE}"
+
+  local -a hits=()
+
+  ${GREP} -qE "(^|[[:space:]])acpi=off([[:space:]]|$)" <<< "${cmdline}" \
+    && hits+=("'acpi=off' disables ACPI entirely - CXL host bridges are ACPI0016 devices and will NOT be enumerated at all")
+  ${GREP} -qE "(^|[[:space:]])numa=off([[:space:]]|$)" <<< "${cmdline}" \
+    && hits+=("'numa=off' disables NUMA - all memory (DRAM and CXL) will appear as a single node regardless of the real socket/CXL topology")
+  ${GREP} -qE "(^|[[:space:]])efi_fake_mem=" <<< "${cmdline}" \
+    && hits+=("'efi_fake_mem=' injects synthetic memory-region attributes; if used to simulate Soft Reserved/CXL-like ranges, everything this tool reports may describe fake, not real, hardware")
+  ${GREP} -qE "(^|[[:space:]])memmap=[^[:space:]]*!" <<< "${cmdline}" \
+    && hits+=("a 'memmap=...!...' synthetic e820 entry is present, which can fabricate reserved/persistent memory ranges not backed by real hardware")
+  ${GREP} -qE "(^|[[:space:]])mem=[0-9]" <<< "${cmdline}" \
+    && hits+=("an explicit 'mem=' cap is present, which can hide real DRAM or CXL capacity from the kernel")
+
+  if [[ -f ${MODULES} ]]; then
+    ${GREP} -qE "^(cxl_test|cxl_mock|nfit_test)[[:space:]]" "${MODULES}" \
+      && hits+=("a CXL/NVDIMM test-mock module (cxl_test/cxl_mock/nfit_test) is loaded - this synthesizes a fake CXL topology for kernel testing and should not be present on a production host")
+  fi
+
+  if [[ ${#hits[@]} -eq 0 ]]; then
+    rule_result PASSED "No debug/synthetic-memory kernel parameters or CXL test modules found. cmdline: '${cmdline}'"
+  else
+    local h
+    for h in "${hits[@]}"; do
+      info_msg "${h}" 2
+    done
+    rule_result WARNING "${#hits[@]} debug/synthetic-memory setting(s) found that can invalidate real CXL/NUMA topology reporting (see details above). cmdline: '${cmdline}'"
+  fi
+}
+
+# Call the main function
+linux_cmdline_debug_params "${OUTPUT_PATH}/cmdline" "${OUTPUT_PATH}/modules"
+
+set +x

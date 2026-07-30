@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_DECODER_GRANULARITY_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_DECODER_GRANULARITY_="Loaded"
+
+# All decoders that make up the same CXL interleave set must agree on
+# 'interleave_granularity' (the byte stride the hardware round-robins across targets
+# before switching to the next one) - a mismatch means the set is misconfigured (or
+# decoders from unrelated sets are being compared). This is a narrower, structural check
+# than 'interleave' (which looks at interleave_ways): granularity can be consistent while
+# ways=1 (nothing interleaved yet), and this rule stays silent in that case.
+function cxl_decoder_granularity() {
+  local FNAME=$1          # 'cxl list -MDT' JSON
+
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  local values
+  values=$(${GREP} -oE "\"interleave_granularity\":[0-9]+" ${FNAME} | ${GREP} -oE "[0-9]+$" | sort -un)
+
+  if [[ -z ${values} ]]; then
+    rule_result SKIPPED "No 'interleave_granularity' fields found in '${FNAME}'. CXL may not be present or configured."
+    return
+  fi
+
+  local count
+  count=$(${GREP} -c "" <<< "${values}")
+
+  if [[ ${count} -gt 1 ]]; then
+    local v
+    while read -r v; do
+      info_msg "interleave_granularity=${v} bytes" 2
+    done <<< "${values}"
+    rule_result WARNING "Multiple (${count}) distinct 'interleave_granularity' values found across CXL decoders. All decoders in the same interleave set must use the same granularity - a mismatch means the interleave set is misconfigured."
+  else
+    rule_result PASSED "All CXL decoder(s) agree on a single interleave_granularity (${values} bytes)."
+  fi
+}
+
+# Call the main function
+cxl_decoder_granularity "${OUTPUT_PATH}/cxl_list_-MDT"
+
+set +x

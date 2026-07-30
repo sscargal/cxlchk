@@ -30,6 +30,7 @@ function collect_cmds() {
     "grep -r . /sys/kernel/mm/numa/"
     "grep -r . /sys/devices/virtual/memory_tiering/"
     "grep -r . /sys/kernel/mm/mempolicy/weighted_interleave/"
+    "grep -rs . /sys/devices/system/node/ --include=demotion_targets"
     "grep -rs . /sys/devices/system/edac/mc/ --include=ce_count --include=ue_count --include=dimm_label --include=dimm_ce_count --include=dimm_ue_count"
     "grep -rs . /sys/devices/system/cpu/cpufreq/ --include=scaling_governor --include=scaling_driver --include=boost"
     "grep -rs . /sys/devices/system/cpu/intel_pstate/"

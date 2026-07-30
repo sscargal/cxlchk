@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_NUMA_DEMOTION_TARGETS_}" ]; then
+  return
+fi
+_MODULE_CHECK_NUMA_DEMOTION_TARGETS_="Loaded"
+
+# 'tpp_demotion_ready' checks the necessary preconditions for demotion (demotion_enabled,
+# and DRAM/CXL split into separate memory tiers). This rule checks the actual result: the
+# per-node '/sys/devices/system/node/nodeN/demotion_targets' list the kernel computed from
+# that tier data. If a DRAM (CPU-bearing) node's demotion_targets points at another DRAM
+# node instead of a CXL node, cold-page reclaim will bounce pages between DRAM nodes
+# instead of spilling them into CXL capacity - silently defeating tiering even though the
+# preconditions look fine.
+function linux_numa_demotion_targets() {
+  local NUMA=$1           # 'numactl -H' text
+  local DFILE=$2          # grep of /sys/devices/system/node/*/demotion_targets
+
+  if [[ ! -f ${NUMA} ]] ; then
+    rule_result SKIPPED "Could not process '${NUMA}'. File not found"
+    return
+  fi
+
+  if [[ ! -f ${DFILE} ]] ; then
+    rule_result SKIPPED "Could not process '${DFILE}'. File not found. Kernel may not expose per-node 'demotion_targets' (requires a NUMA-tiering-capable kernel)."
+    return
+  fi
+
+  local awk_out
+  awk_out=$(${AWK} '
+    # --- File 1: numactl -H (whitespace separated) ---
+    FNR==NR {
+      if ($0 ~ /^node [0-9]+ cpus:/) { n=$2+0; hascpu[n]=(NF>3)?1:0 }
+      else if ($0 ~ /^node [0-9]+ size:/) { n=$2+0; sz[n]=$4+0 }
+      next
+    }
+    # --- File 2: "<path>/nodeN/demotion_targets:<comma list, maybe empty>" per line ---
+    {
+      cpos=index($0, ":")
+      if (cpos==0) { next }
+      path=substr($0,1,cpos-1)
+      val=substr($0,cpos+1)
+      gsub(/^[ \t]+|[ \t]+$/, "", val)
+      if (val=="") { next }
+      sub(/^.*node/, "", path)
+      sub(/\/demotion_targets$/, "", path)
+      node=path+0
+      dtargets[node]=val
+      next
+    }
+    END {
+      for (n in hascpu) {
+        if (hascpu[n]==1) { cpu_nodes[n]=1 }
+        else if (sz[n]>0) { cxl_nodes[n]=1 }
+      }
+
+      rawcxl=0
+      for (c in cxl_nodes) { rawcxl++ }
+      print "RAW_CXL_COUNT " rawcxl
+
+      for (n in dtargets) {
+        if (!(n in cpu_nodes)) { continue }
+        bad=0
+        ntok=split(dtargets[n], toks, ",")
+        for (i=1; i<=ntok; i++) {
+          t=toks[i]+0
+          if (!(t in cxl_nodes)) { bad=1 }
+        }
+        if (bad) { print "DRAM_TO_DRAM " n " " dtargets[n] }
+        else     { print "DRAM_TO_CXL " n " " dtargets[n] }
+      }
+    }
+  ' "${NUMA}" "${DFILE}")
+
+  local raw_cxl
+  raw_cxl=$(${GREP} "^RAW_CXL_COUNT" <<< "${awk_out}" | ${AWK} '{print $2}')
+
+  if [[ -z ${raw_cxl} || ${raw_cxl} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL NUMA node (CPU-less node with memory) found. CXL may not be present or configured."
+    return
+  fi
+
+  local n_good n_bad
+  n_good=$(${GREP} -c "^DRAM_TO_CXL" <<< "${awk_out}")
+  n_bad=$(${GREP} -c "^DRAM_TO_DRAM" <<< "${awk_out}")
+
+  local bad_detail="" good_detail=""
+  local _ n targets
+  while read -r _ n targets; do
+    [[ -z ${n} ]] && continue
+    bad_detail+="node${n}->[${targets}] "
+  done <<< "$(${GREP} "^DRAM_TO_DRAM" <<< "${awk_out}")"
+
+  while read -r _ n targets; do
+    [[ -z ${n} ]] && continue
+    good_detail+="node${n}->[${targets}] "
+  done <<< "$(${GREP} "^DRAM_TO_CXL" <<< "${awk_out}")"
+
+  if [[ ${n_bad} -gt 0 ]]; then
+    rule_result FAILED "DRAM NUMA node demotion target(s) point at another DRAM node instead of a CXL node: ${bad_detail}. This defeats memory tiering - cold DRAM pages are reclaimed onto another DRAM node rather than spilled into CXL capacity. Demotion targets are computed by the kernel from ACPI HMAT/SLIT latency data; this usually means the CXL node isn't being reported as a slower memory tier relative to that DRAM node."
+  elif [[ ${n_good} -eq 0 ]]; then
+    rule_result WARNING "CXL NUMA node(s) are present, but no DRAM node has a 'demotion_targets' entry pointing at them (/sys/devices/system/node/nodeN/demotion_targets). TPP/NUMA demotion will not move cold pages into CXL capacity from any DRAM node."
+  else
+    rule_result PASSED "All DRAM NUMA node(s) with a configured demotion target point only at CXL node(s): ${good_detail}"
+  fi
+}
+
+# Call the main function
+linux_numa_demotion_targets "${OUTPUT_PATH}/numactl_-H" "${OUTPUT_PATH}/grep_-rs_.__sys_devices_system_node__--include=demotion_targets"
+
+set +x
