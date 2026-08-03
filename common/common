@@ -187,6 +187,41 @@ function unknown_msg() {
 
 
 ###############################################################################
+# PCI BDF -> human-readable device lookup
+###############################################################################
+
+# Look up a human-readable description for a PCI BDF from a collected 'lspci' file, so rule
+# output doesn't force the reader to go translate eg. "0000:d3:08.0" into "this is a GPU" or
+# "this is the NVMe drive" by hand. Always returns the BDF itself alongside the description (or
+# alone if no match/no lspci file), never just the description, so the BDF stays available for
+# anyone who wants to go look the device up directly.
+# arg1 = BDF, either full ("0000:d3:08.0") or short ("d3:08.0") form
+# arg2 = path to a collected 'lspci' file
+# Echoes "<bdf> (<description>)" if found, else just "<bdf>"
+function pci_describe() {
+  local bdf=$1
+  local lspci_file=$2
+  local short_bdf="${bdf}"
+  local desc=""
+
+  # lspci omits an all-zero domain (eg. "0000:d3:08.0" -> "d3:08.0"); derive the short form so
+  # the lookup works regardless of which BDF form the caller has.
+  if [[ ${bdf} =~ ^[0-9a-fA-F]{4}: ]]; then
+    short_bdf="${bdf#*:}"
+  fi
+
+  if [[ -f ${lspci_file} ]]; then
+    desc=$(${GREP} -m1 -E "^(${bdf}|${short_bdf})[[:space:]]" "${lspci_file}" | ${SED} -E 's/^[^[:space:]]+[[:space:]]+//')
+  fi
+
+  if [[ -n ${desc} ]]; then
+    echo "${bdf} (${desc})"
+  else
+    echo "${bdf}"
+  fi
+}
+
+###############################################################################
 # Progress Bar
 ###############################################################################
 

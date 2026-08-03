@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_STORAGE_NVME_AVAILABLE_SPARE_}" ]; then
+  return
+fi
+_MODULE_CHECK_STORAGE_NVME_AVAILABLE_SPARE_="Loaded"
+
+# Check the NVMe SMART log's 'available_spare' percentage against its own drive-reported
+# 'available_spare_threshold'. The critical_warning bit0 check (analyzer/storage/
+# nvme_critical_warning) already catches this once the drive itself flags it, but comparing the
+# two percentages directly lets this rule warn while spare capacity is falling but has not yet
+# crossed the drive's threshold.
+function storage_nvme_available_spare() {
+  local FNAME_GLOB="${OUTPUT_PATH}/nvme_smart-log_*"
+  local fname devname spare thresh
+  local ndev=0 bad=0 warned=0 matched=0
+
+  for fname in ${FNAME_GLOB}; do
+    [[ -f ${fname} && ${fname} != *.err ]] || continue
+    matched=1
+    ndev=$((ndev + 1))
+    devname="$(basename "${fname}")"
+    devname="${devname#nvme_smart-log_}"
+
+    # Anchored on ':' immediately after the field name (optionally via whitespace) so
+    # 'available_spare' does not also match 'available_spare_threshold'.
+    spare=$(${GREP} -iE "^available_spare[[:space:]]*:" "${fname}" | ${GREP} -oE "[0-9]+" | head -1)
+    thresh=$(${GREP} -iE "^available_spare_threshold[[:space:]]*:" "${fname}" | ${GREP} -oE "[0-9]+" | head -1)
+
+    if [[ -z ${spare} || -z ${thresh} ]]; then
+      info_msg "${devname}: could not parse available_spare/available_spare_threshold from '${fname}'." 2
+      continue
+    fi
+    # Normalize away any leading zero - bash arithmetic otherwise treats it as (possibly
+    # invalid) octal.
+    spare=$((10#${spare}))
+    thresh=$((10#${thresh}))
+
+    if [[ ${spare} -le ${thresh} ]]; then
+      bad=$((bad + 1))
+      crit_msg "${devname}: available_spare ${spare}% is at or below its threshold of ${thresh}% - the drive is at end of write endurance." 2
+    elif [[ $((spare - thresh)) -le 10 ]]; then
+      warned=$((warned + 1))
+      warn_msg "${devname}: available_spare ${spare}% is within 10 points of its threshold (${thresh}%) - monitor wear trend." 2
+    fi
+  done
+
+  if [[ ${matched} -eq 0 ]]; then
+    rule_result SKIPPED "No 'nvme_smart-log_*' files found in '${OUTPUT_PATH}'. nvme-cli not installed, or no NVMe controllers present."
+    return
+  fi
+
+  if [[ ${bad} -gt 0 ]]; then
+    rule_result CRITICAL "${bad} of ${ndev} NVMe controller(s) have available_spare at or below their threshold. See details above."
+  elif [[ ${warned} -gt 0 ]]; then
+    rule_result WARNING "${warned} of ${ndev} NVMe controller(s) have available_spare approaching their threshold. See details above."
+  else
+    rule_result PASSED "All ${ndev} NVMe controller(s) report available_spare comfortably above their threshold."
+  fi
+}
+
+storage_nvme_available_spare
+
+set +x

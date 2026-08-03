@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_STORAGE_NVME_PERCENTAGE_USED_}" ]; then
+  return
+fi
+_MODULE_CHECK_STORAGE_NVME_PERCENTAGE_USED_="Loaded"
+
+# Check the NVMe SMART log's 'percentage_used' endurance indicator. Per the NVMe spec this is a
+# vendor-calculated wear estimate that reaches 100% at the drive's rated endurance, but can
+# report above 100% - values here are informational until they approach/exceed that limit.
+function storage_nvme_percentage_used() {
+  local FNAME_GLOB="${OUTPUT_PATH}/nvme_smart-log_*"
+  local fname devname used
+  local ndev=0 crit=0 warned=0 matched=0
+
+  for fname in ${FNAME_GLOB}; do
+    [[ -f ${fname} && ${fname} != *.err ]] || continue
+    matched=1
+    ndev=$((ndev + 1))
+    devname="$(basename "${fname}")"
+    devname="${devname#nvme_smart-log_}"
+
+    used=$(${GREP} -iE "^percentage_used[[:space:]]*:" "${fname}" | ${GREP} -oE "[0-9]+" | head -1)
+    if [[ -z ${used} ]]; then
+      info_msg "${devname}: could not parse 'percentage_used' from '${fname}'." 2
+      continue
+    fi
+    # Normalize away any leading zero - bash arithmetic otherwise treats it as (possibly
+    # invalid) octal.
+    used=$((10#${used}))
+
+    if [[ ${used} -ge 100 ]]; then
+      crit=$((crit + 1))
+      crit_msg "${devname}: percentage_used is ${used}% - the drive has reached or exceeded its rated write endurance." 2
+    elif [[ ${used} -ge 90 ]]; then
+      warned=$((warned + 1))
+      warn_msg "${devname}: percentage_used is ${used}% - approaching its rated write endurance." 2
+    fi
+  done
+
+  if [[ ${matched} -eq 0 ]]; then
+    rule_result SKIPPED "No 'nvme_smart-log_*' files found in '${OUTPUT_PATH}'. nvme-cli not installed, or no NVMe controllers present."
+    return
+  fi
+
+  if [[ ${crit} -gt 0 ]]; then
+    rule_result CRITICAL "${crit} of ${ndev} NVMe controller(s) have reached/exceeded 100% of rated write endurance. See details above - plan replacement."
+  elif [[ ${warned} -gt 0 ]]; then
+    rule_result WARNING "${warned} of ${ndev} NVMe controller(s) are at or above 90% of rated write endurance. See details above."
+  else
+    rule_result PASSED "All ${ndev} NVMe controller(s) report percentage_used below 90%."
+  fi
+}
+
+storage_nvme_percentage_used
+
+set +x

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+#################################################################################################
+# PCIe AER (Advanced Error Reporting) error-counter collector
+#################################################################################################
+
+# Every entry under /sys/bus/pci/devices/<BDF> is a symlink into /sys/devices/, so a plain
+# 'grep -r' (which does not follow symlinks, as used elsewhere in collect_commands for real
+# directory trees) silently finds nothing here, while 'grep -R' (which follows them) re-walks
+# the same devices reachable via multiple /sys paths and can hang. Glob the specific counter
+# files directly instead - this covers every PCIe root port and endpoint on the host, which is
+# also how CXL.io transport-layer errors surface (CXL runs over PCIe, so a non-zero counter
+# against a CXL root port/endpoint BDF is a CXL.io error).
+function pcie_aer_collector() {
+  echo "Collecting PCIe AER error counters"
+
+  local aer_files=(
+    /sys/bus/pci/devices/*/aer_dev_correctable
+    /sys/bus/pci/devices/*/aer_dev_fatal
+    /sys/bus/pci/devices/*/aer_dev_nonfatal
+    /sys/bus/pci/devices/*/aer_rootport_total_err_cor
+    /sys/bus/pci/devices/*/aer_rootport_total_err_fatal
+    /sys/bus/pci/devices/*/aer_rootport_total_err_nonfatal
+  )
+  local f line
+  local OUT_FILE="${OUTPUT_PATH}/pcie_aer_counters"
+  local ERR_FILE="${OUTPUT_PATH}/pcie_aer_counters.err"
+
+  : > "${OUT_FILE}"
+  : > "${ERR_FILE}"
+
+  init_progressbar "${#aer_files[@]}"
+
+  for f in "${aer_files[@]}"; do
+    # inc_progressbar writes directly to the terminal (no trailing newline), so it must stay
+    # outside the redirected block below or its progress text ends up inside the data file.
+    inc_progressbar
+    if [[ -r ${f} ]]; then
+      while IFS= read -r line; do
+        echo "${f}:${line}"
+      done < "${f}" >> "${OUT_FILE}" 2>> "${ERR_FILE}"
+    fi
+  done
+  echo ""
+}
+
+#################################################################################################
+# Main
+#################################################################################################
+
+pcie_aer_collector

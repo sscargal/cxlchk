@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_STORAGE_SMART_SSD_WEAR_}" ]; then
+  return
+fi
+_MODULE_CHECK_STORAGE_SMART_SSD_WEAR_="Loaded"
+
+# Check SATA/SAS SSD wear-leveling attributes (collected via 'smartctl -a'). Vendors disagree on
+# both the attribute ID and the direction of "good": SSD_Life_Left/Media_Wearout_Indicator/
+# Wear_Leveling_Count report their normalized VALUE counting DOWN from ~100/200 to THRESH as the
+# SSD wears, so VALUE (not RAW_VALUE) is what matters here - unlike smart_bad_sectors, where
+# RAW_VALUE is the signal. NVMe SSDs are not covered by this rule; use
+# analyzer/storage/nvme_percentage_used instead (nvme-cli's percentage_used counts UP).
+function storage_smart_ssd_wear() {
+  local FNAME_GLOB="${OUTPUT_PATH}/smartctl_-a_*"
+  local fname devname line attr value thresh
+  local ndev=0 crit=0 warned=0 matched=0
+
+  for fname in ${FNAME_GLOB}; do
+    [[ -f ${fname} && ${fname} != *.err ]] || continue
+
+    ${GREP} -qE "^[[:space:]]*(177|202|231|233)[[:space:]]+(Wear_Leveling_Count|Percent_Lifetime_Remain|SSD_Life_Left|Media_Wearout_Indicator)" "${fname}" || continue
+
+    matched=1
+    ndev=$((ndev + 1))
+    devname="$(basename "${fname}")"
+    devname="${devname#smartctl_-a_}"
+
+    local dev_state=""
+    while read -r line; do
+      [[ -z ${line} ]] && continue
+      attr=$(${AWK} '{print $2}' <<< "${line}")
+      value=$(${AWK} '{print $4}' <<< "${line}")
+      thresh=$(${AWK} '{print $6}' <<< "${line}")
+      # VALUE/THRESH are zero-padded (eg. "090"), and bash arithmetic treats a leading zero as
+      # octal - force base-10 interpretation with the '10#' prefix to avoid an invalid-octal-
+      # digit error (eg. "090", "008").
+      if [[ ${value} =~ ^[0-9]+$ && ${thresh} =~ ^[0-9]+$ ]]; then
+        if (( 10#${value} <= 10#${thresh} )); then
+          dev_state="CRIT"
+          crit_msg "${devname}: ${attr} VALUE ${value} is at or below THRESH ${thresh} - the SSD has reached its rated wear limit." 2
+        elif [[ ${dev_state} != "CRIT" ]] && (( 10#${value} <= 10#${thresh} + 10 )); then
+          dev_state="WARN"
+          warn_msg "${devname}: ${attr} VALUE ${value} is within 10 points of THRESH ${thresh} - approaching rated wear limit." 2
+        fi
+      fi
+    done <<< "$(${GREP} -E "^[[:space:]]*(177|202|231|233)[[:space:]]+(Wear_Leveling_Count|Percent_Lifetime_Remain|SSD_Life_Left|Media_Wearout_Indicator)" "${fname}")"
+
+    case "${dev_state}" in
+      CRIT) crit=$((crit + 1)) ;;
+      WARN) warned=$((warned + 1)) ;;
+    esac
+  done
+
+  if [[ ${matched} -eq 0 ]]; then
+    rule_result SKIPPED "No 'smartctl_-a_*' files with a wear-leveling attribute found in '${OUTPUT_PATH}'. smartmontools not installed, or no SATA/SAS SSD present."
+    return
+  fi
+
+  if [[ ${crit} -gt 0 ]]; then
+    rule_result CRITICAL "${crit} of ${ndev} SATA/SAS SSD(s) have reached their rated wear limit. See details above - plan replacement."
+  elif [[ ${warned} -gt 0 ]]; then
+    rule_result WARNING "${warned} of ${ndev} SATA/SAS SSD(s) are approaching their rated wear limit. See details above."
+  else
+    rule_result PASSED "All ${ndev} SATA/SAS SSD(s) report wear-leveling attributes well above their threshold."
+  fi
+}
+
+storage_smart_ssd_wear
+
+set +x

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_STORAGE_NVME_PCIE_AER_CORRELATION_}" ]; then
+  return
+fi
+_MODULE_CHECK_STORAGE_NVME_PCIE_AER_CORRELATION_="Loaded"
+
+# Correlate every NVMe controller with the kernel's persistent PCIe AER error counters
+# (collector/modules/pcie_aer), checking BOTH the drive's own BDF and its immediate upstream
+# root port's BDF (collector/modules/storage records this mapping in 'nvme_pci_addresses').
+# This matters because a physical-layer error (eg. RxErr) is very often logged against the
+# ROOT PORT the drive is plugged into, not the drive's own endpoint function - an NVMe drive
+# throwing unexplained latency/errors with a perfectly clean SMART log is frequently actually a
+# link/slot/cable/riser problem on its root port, not a drive fault. This is the direct
+# generalization of tracing a "PCIe Bus Error ... Receiver ID" dmesg line back to the drive
+# behind it.
+function storage_nvme_pcie_aer_correlation() {
+  local MAPFNAME=$1   # 'nvme_pci_addresses': "<nvmeN> <endpoint_bdf> <parent_bdf>"
+  local AERFNAME=$2   # Collected 'pcie_aer_counters' file (see collector/modules/pcie_aer)
+  local LSPCI=$3      # Collected 'lspci' file, used only to describe the root port in human terms
+  local name bdf parent parent_desc
+  local ndev=0 crit=0 warned=0
+
+  if [[ ! -f ${MAPFNAME} ]]; then
+    rule_result SKIPPED "Could not process '${MAPFNAME}'. No NVMe controllers found under /sys/class/nvme."
+    return
+  fi
+
+  if [[ ! -f ${AERFNAME} ]]; then
+    rule_result SKIPPED "Could not process '${AERFNAME}'. File not found (kernel may not have CONFIG_PCIEAER enabled)."
+    return
+  fi
+
+  while read -r name bdf parent; do
+    [[ -z ${name} ]] && continue
+    ndev=$((ndev + 1))
+
+    local ep_cor ep_fatal ep_nonfatal rp_cor rp_fatal rp_nonfatal
+    ep_cor=$(${GREP} -F "${bdf}/aer_dev_correctable:TOTAL_ERR_COR " "${AERFNAME}" | ${AWK} '{print $NF}')
+    ep_fatal=$(${GREP} -F "${bdf}/aer_dev_fatal:TOTAL_ERR_FATAL " "${AERFNAME}" | ${AWK} '{print $NF}')
+    ep_nonfatal=$(${GREP} -F "${bdf}/aer_dev_nonfatal:TOTAL_ERR_NONFATAL " "${AERFNAME}" | ${AWK} '{print $NF}')
+    rp_cor=$(${GREP} -F "${parent}/aer_dev_correctable:TOTAL_ERR_COR " "${AERFNAME}" | ${AWK} '{print $NF}')
+    rp_fatal=$(${GREP} -F "${parent}/aer_dev_fatal:TOTAL_ERR_FATAL " "${AERFNAME}" | ${AWK} '{print $NF}')
+    rp_nonfatal=$(${GREP} -F "${parent}/aer_dev_nonfatal:TOTAL_ERR_NONFATAL " "${AERFNAME}" | ${AWK} '{print $NF}')
+    ep_cor=${ep_cor:-0}; ep_fatal=${ep_fatal:-0}; ep_nonfatal=${ep_nonfatal:-0}
+    rp_cor=${rp_cor:-0}; rp_fatal=${rp_fatal:-0}; rp_nonfatal=${rp_nonfatal:-0}
+    parent_desc=$(pci_describe "${parent}" "${LSPCI}")
+
+    if [[ ${ep_fatal} -gt 0 || ${ep_nonfatal} -gt 0 || ${rp_fatal} -gt 0 || ${rp_nonfatal} -gt 0 ]]; then
+      crit=$((crit + 1))
+      crit_msg "${name} (${bdf}, upstream port ${parent_desc}): uncorrectable AER error(s) - drive: ${ep_fatal} fatal/${ep_nonfatal} non-fatal, root port: ${rp_fatal} fatal/${rp_nonfatal} non-fatal." 2
+    elif [[ ${ep_cor} -gt 0 || ${rp_cor} -gt 0 ]]; then
+      warned=$((warned + 1))
+      if [[ ${rp_cor} -gt 0 ]]; then
+        warn_msg "${name} (${bdf}): its upstream root port ${parent_desc} has logged ${rp_cor} correctable AER error(s) (eg. RxErr). This is very often a link/slot/cable/riser issue, not the drive itself - see analyzer/pcie/aer_error_counters for the root port detail." 2
+      fi
+      if [[ ${ep_cor} -gt 0 ]]; then
+        warn_msg "${name} (${bdf}): the drive's own endpoint function has logged ${ep_cor} correctable AER error(s)." 2
+      fi
+    fi
+  done < "${MAPFNAME}"
+
+  if [[ ${ndev} -eq 0 ]]; then
+    rule_result SKIPPED "'${MAPFNAME}' contained no NVMe controller entries."
+    return
+  fi
+
+  if [[ ${crit} -gt 0 ]]; then
+    rule_result CRITICAL "${crit} of ${ndev} NVMe controller(s) are behind a link (drive or root port) with uncorrectable AER errors. See details above."
+  elif [[ ${warned} -gt 0 ]]; then
+    rule_result WARNING "${warned} of ${ndev} NVMe controller(s) are behind a link (drive or root port) with correctable AER errors. See details above."
+  else
+    rule_result PASSED "All ${ndev} NVMe controller(s) and their upstream root ports report zero correctable/uncorrectable AER errors."
+  fi
+}
+
+storage_nvme_pcie_aer_correlation "${OUTPUT_PATH}/nvme_pci_addresses" "${OUTPUT_PATH}/pcie_aer_counters" "${OUTPUT_PATH}/lspci"
+
+set +x

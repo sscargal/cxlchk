@@ -16,6 +16,8 @@ SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]:-$0}"; )" &> /dev/null && 
 DAXCTL=("$(command -v daxctl)")     # Path to daxctl
 NDCTL=("$(command -v ndctl)")       # Path to ndctl
 CXLCLI=("$(command -v cxl)")			  # Path to cxl, use -c option to specify the location of the cxl binary
+NVMECLI=("$(command -v nvme)")      # Path to nvme (nvme-cli), used to collect NVMe SMART/error-log data
+SMARTCTL=("$(command -v smartctl)") # Path to smartctl (smartmontools), used to collect SATA/SAS/NVMe SMART data
 BC=("$(command -v bc)")				      # Path to bc
 NUMACTL=("$(command -v numactl)")		# Path to numactl
 LSCPU=("$(command -v lscpu)")       # Path to lscpu
@@ -133,10 +135,28 @@ function verify_cmds() {
   # cxl is optional and only available in NDCTL version 72 or later
   if [ ! -x "${CXLCLI}" ]; then
     echo "INFO: cxl command not found! Use -c to specify the location."
-    err_state=false 
+    err_state=false
   else
     echo "Using CXL command: ${CXLCLI}"
     echo "CXL version: $(${CXLCLI} version)"
+  fi
+
+  # nvme (nvme-cli) is optional
+  if [ ! -x "${NVMECLI}" ]; then
+    echo "INFO: nvme command not found! NVMe SMART/error-log collection will be skipped."
+    err_state=false
+  else
+    echo "Using NVME command: ${NVMECLI}"
+    echo "NVME-CLI version: $(${NVMECLI} version | head -1)"
+  fi
+
+  # smartctl (smartmontools) is optional
+  if [ ! -x "${SMARTCTL}" ]; then
+    echo "INFO: smartctl command not found! SATA/SAS/NVMe SMART collection will be skipped."
+    err_state=false
+  else
+    echo "Using SMARTCTL command: ${SMARTCTL}"
+    echo "SMARTCTL version: $(${SMARTCTL} --version | head -1)"
   fi
 
   for CMD in awk sed numactl lscpu grep egrep mount wc mountpoint cut bc cp find tee; do

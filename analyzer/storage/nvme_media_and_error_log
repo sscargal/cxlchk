@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_STORAGE_NVME_MEDIA_AND_ERROR_LOG_}" ]; then
+  return
+fi
+_MODULE_CHECK_STORAGE_NVME_MEDIA_AND_ERROR_LOG_="Loaded"
+
+# Check the NVMe SMART log's 'media_errors' (unrecovered data-integrity errors) and
+# 'num_err_log_entries' (cumulative firmware error-log entries) counters. These are the drive's
+# own accumulated fault counters, independent of anything the host driver/PCIe layer logs - a
+# non-zero media_errors count means the drive itself detected unrecoverable data corruption.
+function storage_nvme_media_and_error_log() {
+  local FNAME_GLOB="${OUTPUT_PATH}/nvme_smart-log_*"
+  local fname devname media errlog
+  local ndev=0 crit=0 warned=0 matched=0
+
+  for fname in ${FNAME_GLOB}; do
+    [[ -f ${fname} && ${fname} != *.err ]] || continue
+    matched=1
+    ndev=$((ndev + 1))
+    devname="$(basename "${fname}")"
+    devname="${devname#nvme_smart-log_}"
+
+    media=$(${GREP} -iE "^media_errors[[:space:]]*:" "${fname}" | ${GREP} -oE "[0-9]+" | head -1)
+    errlog=$(${GREP} -iE "^num_err_log_entries[[:space:]]*:" "${fname}" | ${GREP} -oE "[0-9]+" | head -1)
+    # Default to 0 and normalize away any leading zero - bash arithmetic otherwise treats a
+    # zero-padded value as (possibly invalid) octal.
+    media=$((10#${media:-0}))
+    errlog=$((10#${errlog:-0}))
+
+    if [[ ${media} -gt 0 ]]; then
+      crit=$((crit + 1))
+      crit_msg "${devname}: media_errors=${media} (num_err_log_entries=${errlog}) - the drive has detected unrecoverable data-integrity error(s)." 2
+    elif [[ ${errlog} -gt 0 ]]; then
+      warned=$((warned + 1))
+      warn_msg "${devname}: num_err_log_entries=${errlog} with media_errors=0 - review 'nvme_error-log_${devname}' for the specific fault(s) logged." 2
+    fi
+  done
+
+  if [[ ${matched} -eq 0 ]]; then
+    rule_result SKIPPED "No 'nvme_smart-log_*' files found in '${OUTPUT_PATH}'. nvme-cli not installed, or no NVMe controllers present."
+    return
+  fi
+
+  if [[ ${crit} -gt 0 ]]; then
+    rule_result CRITICAL "${crit} of ${ndev} NVMe controller(s) report non-zero media_errors (unrecoverable data-integrity errors). See details above."
+  elif [[ ${warned} -gt 0 ]]; then
+    rule_result WARNING "${warned} of ${ndev} NVMe controller(s) have logged firmware error-log entries (no media errors yet). See details above."
+  else
+    rule_result PASSED "All ${ndev} NVMe controller(s) report zero media_errors and zero error-log entries."
+  fi
+}
+
+storage_nvme_media_and_error_log
+
+set +x

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_IO_AER_COUNTERS_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_IO_AER_COUNTERS_="Loaded"
+
+# CXL.io is the PCIe-compatible transport used for CXL device discovery/config/enumeration, so
+# a CXL device's transport-layer errors surface as ordinary PCIe AER events against its BDF (and
+# against the root port it is attached to). This rule correlates the CXL device BDFs found in
+# 'lspci' with the kernel's persistent sysfs AER counters (collector/modules/pcie_aer) - a
+# complement to analyzer/cxl/ras_aer_errors, which instead scans dmesg: dmesg can wrap/rotate
+# and lose history, while these sysfs counters are an accumulated tally that survives it.
+#
+# CXL.cache and CXL.mem do not have an equivalent generic transport error-counter exposed in
+# sysfs; their error/health state is instead reported via the CXL mailbox and already checked
+# by analyzer/cxl/memdev_errors (accumulated volatile/pmem media errors) and
+# analyzer/cxl/memdev_health (device health status).
+function cxl_io_aer_counters() {
+  local LSPCI=$1    # 'lspci' file (used to find CXL BDFs)
+  local AERFNAME=$2 # Collected 'pcie_aer_counters' file (see collector/modules/pcie_aer)
+  local bdf
+  local nbdf=0 crit_bdfs=0 warn_bdfs=0
+
+  if [[ ! -f ${LSPCI} ]]; then
+    rule_result SKIPPED "Could not process '${LSPCI}'. Cannot identify CXL PCI devices."
+    return
+  fi
+
+  if [[ ! -f ${AERFNAME} ]]; then
+    rule_result SKIPPED "Could not process '${AERFNAME}'. File not found (kernel may not have CONFIG_PCIEAER enabled)."
+    return
+  fi
+
+  while read -r bdf; do
+    [[ -z ${bdf} ]] && continue
+    nbdf=$((nbdf + 1))
+
+    # lspci abbreviates the all-zero PCI domain (eg. "d3:08.0"), but the collected sysfs paths
+    # are always fully qualified (eg. "0000:d3:08.0") - match as a substring, not an anchored
+    # path component, the same way analyzer/cxl/ras_aer_errors correlates BDFs against dmesg.
+    local c f nf desc
+    c=$(${GREP} -F "${bdf}/aer_dev_correctable:TOTAL_ERR_COR " "${AERFNAME}" | ${AWK} '{print $NF}')
+    f=$(${GREP} -F "${bdf}/aer_dev_fatal:TOTAL_ERR_FATAL " "${AERFNAME}" | ${AWK} '{print $NF}')
+    nf=$(${GREP} -F "${bdf}/aer_dev_nonfatal:TOTAL_ERR_NONFATAL " "${AERFNAME}" | ${AWK} '{print $NF}')
+    c=${c:-0}; f=${f:-0}; nf=${nf:-0}
+    desc=$(pci_describe "${bdf}" "${LSPCI}")
+
+    if [[ ${f} -gt 0 || ${nf} -gt 0 ]]; then
+      crit_bdfs=$((crit_bdfs + 1))
+      crit_msg "CXL device ${desc}: ${f} FATAL, ${nf} NON-FATAL uncorrectable CXL.io (PCIe AER) error(s) recorded." 2
+    elif [[ ${c} -gt 0 ]]; then
+      warn_bdfs=$((warn_bdfs + 1))
+      warn_msg "CXL device ${desc}: ${c} correctable CXL.io (PCIe AER) error(s) recorded." 2
+    fi
+  done <<< "$(${GREP} -i CXL ${LSPCI} | ${AWK} '{print $1}')"
+
+  if [[ ${nbdf} -eq 0 ]]; then
+    rule_result SKIPPED "No CXL PCI devices found in '${LSPCI}'."
+    return
+  fi
+
+  if [[ ${crit_bdfs} -gt 0 ]]; then
+    rule_result CRITICAL "${crit_bdfs} of ${nbdf} CXL device(s) have accumulated FATAL/NON-FATAL CXL.io transport errors. This is a serious link/device fault - memory/cache traffic to this device is at risk."
+  elif [[ ${warn_bdfs} -gt 0 ]]; then
+    rule_result WARNING "${warn_bdfs} of ${nbdf} CXL device(s) have accumulated correctable CXL.io transport errors. Monitor for escalation to uncorrectable."
+  else
+    rule_result PASSED "All ${nbdf} CXL device(s) report zero accumulated CXL.io (PCIe AER) transport errors."
+  fi
+}
+
+cxl_io_aer_counters "${OUTPUT_PATH}/lspci" "${OUTPUT_PATH}/pcie_aer_counters"
+
+set +x

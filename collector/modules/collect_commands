@@ -21,6 +21,8 @@ function collect_cmds() {
     "lsmem -o RANGE,SIZE,STATE,REMOVABLE,ZONES,NODE,BLOCK"
     "lsmem -a -o RANGE,SIZE,STATE,REMOVABLE,ZONES,NODE,BLOCK"
     "lsmod"
+    "lsblk -o NAME,MODEL,SERIAL,SIZE,ROTA,TYPE,TRAN,STATE,VENDOR"
+    "lsblk -d -o NAME,ROTA,TYPE,TRAN"
     "numactl -H"
     "numactl --help"
     "numactl --version"

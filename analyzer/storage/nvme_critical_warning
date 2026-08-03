@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_STORAGE_NVME_CRITICAL_WARNING_}" ]; then
+  return
+fi
+_MODULE_CHECK_STORAGE_NVME_CRITICAL_WARNING_="Loaded"
+
+# Decode the NVMe SMART/Health Information Log 'critical_warning' bitfield for every collected
+# NVMe controller (nvme smart-log). Any bit set is an immediate, vendor-independent signal from
+# the drive's own firmware that something is wrong - this is the single most important NVMe
+# health field to check.
+function storage_nvme_critical_warning() {
+  local FNAME_GLOB="${OUTPUT_PATH}/nvme_smart-log_*"
+  local fname devname cw
+  local ndev=0 bad=0
+  local -a bit_desc=(
+    "available spare space has fallen below threshold"
+    "temperature has exceeded a critical threshold"
+    "NVM subsystem reliability degraded (significant media/internal errors)"
+    "media has been placed in read-only mode"
+    "volatile memory backup device has failed"
+    "persistent memory region has become read-only or unreliable"
+  )
+
+  local matched=0
+  for fname in ${FNAME_GLOB}; do
+    [[ -f ${fname} && ${fname} != *.err ]] || continue
+    matched=1
+    ndev=$((ndev + 1))
+    devname="$(basename "${fname}")"
+    devname="${devname#nvme_smart-log_}"
+
+    cw=$(${GREP} -iE "^critical_warning[[:space:]]*:" "${fname}" | ${GREP} -oE "[0-9]+" | head -1)
+    if [[ -z ${cw} ]]; then
+      info_msg "${devname}: could not parse 'critical_warning' from '${fname}'." 2
+      continue
+    fi
+    # Normalize away any leading zero - bash arithmetic otherwise treats it as (possibly
+    # invalid) octal.
+    cw=$((10#${cw}))
+
+    if [[ ${cw} -ne 0 ]]; then
+      bad=$((bad + 1))
+      local i bit_set
+      for i in "${!bit_desc[@]}"; do
+        bit_set=$(( (cw >> i) & 1 ))
+        if [[ ${bit_set} -eq 1 ]]; then
+          crit_msg "${devname}: critical_warning bit ${i} set - ${bit_desc[$i]}." 2
+        fi
+      done
+    fi
+  done
+
+  if [[ ${matched} -eq 0 ]]; then
+    rule_result SKIPPED "No 'nvme_smart-log_*' files found in '${OUTPUT_PATH}'. nvme-cli not installed, or no NVMe controllers present."
+    return
+  fi
+
+  if [[ ${bad} -gt 0 ]]; then
+    rule_result CRITICAL "${bad} of ${ndev} NVMe controller(s) report a non-zero critical_warning. See details above - this is the drive's own firmware flagging a health problem."
+  else
+    rule_result PASSED "All ${ndev} NVMe controller(s) report critical_warning = 0 (no active health flags)."
+  fi
+}
+
+storage_nvme_critical_warning
+
+set +x

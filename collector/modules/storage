@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+
+#################################################################################################
+# Storage (NVMe / SATA / SAS SSD & HDD) collector
+#################################################################################################
+
+# Map each NVMe controller (nvme0, nvme1, ...) to its own PCI BDF, and to its immediate upstream
+# root port/switch port's BDF (the parent directory in the sysfs device path), via the sysfs
+# 'device' symlink. This has no nvme-cli dependency, so it always runs when /sys/class/nvme
+# exists, and lets the analyzer correlate a specific NVMe drive with PCIe AER counters collected
+# separately by collector/modules/pcie_aer (this is how the AER RxErr on a root port gets traced
+# to the NVMe endpoint behind it).
+function storage_map_nvme_pci_addresses() {
+  local OUT_FILE="${OUTPUT_PATH}/nvme_pci_addresses"
+  local dev name devpath bdf parent_bdf
+
+  : > "${OUT_FILE}"
+
+  for dev in /sys/class/nvme/nvme[0-9]*; do
+    [[ -e ${dev} ]] || continue
+    name=$(basename "${dev}")
+    if [[ -e ${dev}/device ]]; then
+      devpath=$(readlink -f "${dev}/device")
+      bdf=$(basename "${devpath}")
+      parent_bdf=$(basename "$(dirname "${devpath}")")
+      echo "${name} ${bdf} ${parent_bdf}" >> "${OUT_FILE}"
+    fi
+  done
+}
+
+function storage_nvme_collector() {
+  echo "Running NVMe Collector"
+
+  if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+    debug_msg "Using ${NVMECLI}"
+  fi
+
+  IFS="" #Change the delimiter to prevent Bash separating elements by spaces
+  nvme_global_args=(
+    "version"
+    "list"
+    "list -v"
+  )
+
+  # Initialize the progress bar
+  init_progressbar "${#nvme_global_args[@]}"
+
+  for arg in ${nvme_global_args[@]}; do
+    # Provide progress to user
+    inc_progressbar
+
+    OFNAME="nvme ${arg}"
+    OFNAME="${OFNAME// /_}" # Use the Bash string replace feature rather than calling sed or awk
+    CMD_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}"
+    CMD_ERR_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}.err"
+    if eval "${NVMECLI} ${arg}" 2> ${CMD_ERR_OUTPUT_FILE} 1> ${CMD_OUTPUT_FILE} ; then
+      if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+        debug_msg "${NVMECLI} ${arg} Command ${green}succeeded${normal}"
+      fi
+    else
+      if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+        debug_msg "${NVMECLI} ${arg} Command ${red}failed${normal}"
+      fi
+    fi
+  done
+  echo ""
+
+  # Per-controller commands: discover NVMe char devices (/dev/nvme0, /dev/nvme1, ...) and
+  # exclude namespace/partition block devices (/dev/nvme0n1, /dev/nvme0n1p1, ...) that also
+  # match a broader glob.
+  local nvme_devs=()
+  local dev
+  for dev in /dev/nvme*; do
+    [[ -e ${dev} ]] || continue
+    [[ ${dev} =~ ^/dev/nvme[0-9]+$ ]] || continue
+    nvme_devs+=("${dev}")
+  done
+
+  if [[ ${#nvme_devs[@]} -eq 0 ]]; then
+    echo "No /dev/nvme<N> controller nodes found. Skipping per-device NVMe collection."
+    return
+  fi
+
+  nvme_dev_args=(
+    "smart-log"
+    "error-log"
+    "id-ctrl"
+    "fw-log"
+  )
+
+  # Initialize the progress bar
+  init_progressbar $(( ${#nvme_devs[@]} * ${#nvme_dev_args[@]} ))
+
+  for dev in "${nvme_devs[@]}"; do
+    local devname
+    devname=$(basename "${dev}")
+    for arg in ${nvme_dev_args[@]}; do
+      # Provide progress to user
+      inc_progressbar
+
+      OFNAME="nvme_${arg}_${devname}"
+      OFNAME="${OFNAME// /_}"
+      CMD_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}"
+      CMD_ERR_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}.err"
+      if eval "${NVMECLI} ${arg} ${dev}" 2> ${CMD_ERR_OUTPUT_FILE} 1> ${CMD_OUTPUT_FILE} ; then
+        if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+          debug_msg "${NVMECLI} ${arg} ${dev} Command ${green}succeeded${normal}"
+        fi
+      else
+        if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+          debug_msg "${NVMECLI} ${arg} ${dev} Command ${red}failed${normal}"
+        fi
+      fi
+    done
+  done
+  echo ""
+}
+
+function storage_smartctl_collector() {
+  echo "Running SMART (smartctl) Collector"
+
+  if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+    debug_msg "Using ${SMARTCTL}"
+  fi
+
+  local SCAN_FILE="${OUTPUT_PATH}/smartctl_--scan"
+  ${SMARTCTL} --scan > "${SCAN_FILE}" 2> "${SCAN_FILE}.err"
+
+  # Parse the device name (first field) out of each scan line, eg:
+  #   /dev/sda -d scsi # /dev/sda, SCSI device
+  #   /dev/nvme0 -d nvme # /dev/nvme0, NVMe device
+  local devs=()
+  local line dev
+  while IFS= read -r line; do
+    [[ -z ${line} ]] && continue
+    dev="${line%% *}"
+    [[ -n ${dev} ]] && devs+=("${dev}")
+  done < "${SCAN_FILE}"
+
+  if [[ ${#devs[@]} -eq 0 ]]; then
+    echo "No devices reported by 'smartctl --scan'. Skipping per-device SMART collection."
+    return
+  fi
+
+  # Initialize the progress bar
+  init_progressbar "${#devs[@]}"
+
+  for dev in "${devs[@]}"; do
+    # Provide progress to user
+    inc_progressbar
+
+    OFNAME="smartctl_-a_$(basename "${dev}")"
+    CMD_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}"
+    CMD_ERR_OUTPUT_FILE="${OUTPUT_PATH}/${OFNAME}.err"
+    if eval "${SMARTCTL} -a ${dev}" 2> ${CMD_ERR_OUTPUT_FILE} 1> ${CMD_OUTPUT_FILE} ; then
+      if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+        debug_msg "${SMARTCTL} -a ${dev} Command ${green}succeeded${normal}"
+      fi
+    else
+      # smartctl uses a non-zero bitmask exit status for various (often benign) conditions,
+      # so this is not treated as a hard failure - only logged when debugging.
+      if [ "${OPT_VERBOSITY}" -ge 1 ]; then
+        debug_msg "${SMARTCTL} -a ${dev} Command ${red}returned non-zero${normal}"
+      fi
+    fi
+  done
+  echo ""
+}
+
+#################################################################################################
+# Main
+#################################################################################################
+
+# The NVMe -> PCI BDF mapping has no external tool dependency
+storage_map_nvme_pci_addresses
+
+# Run the NVMe collector module if the 'nvme' command was found
+if [[ ! -z "${NVMECLI}" ]]; then
+  storage_nvme_collector
+else
+  echo "Skipping NVMe collector. 'nvme' command not found"
+fi
+
+# Run the SMART collector module if the 'smartctl' command was found
+if [[ ! -z "${SMARTCTL}" ]]; then
+  storage_smartctl_collector
+else
+  echo "Skipping SMART collector. 'smartctl' command not found"
+fi

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_PCIE_AER_ERROR_COUNTERS_}" ]; then
+  return
+fi
+_MODULE_CHECK_PCIE_AER_ERROR_COUNTERS_="Loaded"
+
+# Check the kernel's persistent per-device PCIe AER (Advanced Error Reporting) error counters
+# for every PCIe root port and endpoint in the system (sysfs aer_dev_correctable/aer_dev_fatal/
+# aer_dev_nonfatal, plus aer_rootport_total_err_* on root ports). Unlike scanning dmesg, these
+# counters are an accumulated tally that survives log rotation and dmesg buffer wraparound.
+#
+# CXL runs over PCIe, so a non-zero counter against a CXL root port/endpoint BDF is a CXL.io
+# transport-layer error - this rule is not CXL-specific, but any CXL device found here is also
+# reported by analyzer/cxl/cxl_io_aer_counters with CXL-specific framing.
+function pcie_aer_error_counters() {
+  local FNAME=$1    # Collected 'pcie_aer_counters' file (see collector/modules/pcie_aer)
+  local LSPCI=$2    # Collected 'lspci' file, used only to describe a BDF in human terms
+  local -A cor fatal nonfatal rp_cor
+  local line rest bdf value desc
+  local ndev=0 crit_bdfs=0 warn_bdfs=0
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]]; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found (kernel may not have CONFIG_PCIEAER enabled, or no PCIe device exposes AER counters)."
+    return
+  fi
+
+  while IFS= read -r line; do
+    [[ -z ${line} ]] && continue
+    rest="${line#/sys/bus/pci/devices/}"
+    bdf="${rest%%/*}"
+    rest="${rest#*/}"
+
+    case "${rest}" in
+      "aer_dev_correctable:TOTAL_ERR_COR "*)
+        value="${rest##* }"
+        cor[${bdf}]=${value}
+        ;;
+      "aer_dev_fatal:TOTAL_ERR_FATAL "*)
+        value="${rest##* }"
+        fatal[${bdf}]=${value}
+        ;;
+      "aer_dev_nonfatal:TOTAL_ERR_NONFATAL "*)
+        value="${rest##* }"
+        nonfatal[${bdf}]=${value}
+        ;;
+      "aer_rootport_total_err_cor:"*)
+        rp_cor[${bdf}]="${rest#*:}"
+        ;;
+      *)
+        ;;
+    esac
+  done < "${FNAME}"
+
+  # Union of every BDF with a device-level counter
+  local -A seen
+  for bdf in "${!cor[@]}" "${!fatal[@]}" "${!nonfatal[@]}"; do
+    seen[${bdf}]=1
+  done
+  ndev=${#seen[@]}
+
+  if [[ ${ndev} -eq 0 ]]; then
+    rule_result SKIPPED "No AER TOTAL_ERR_* counters found in '${FNAME}'."
+    return
+  fi
+
+  for bdf in "${!seen[@]}"; do
+    local c=${cor[${bdf}]:-0}
+    local f=${fatal[${bdf}]:-0}
+    local nf=${nonfatal[${bdf}]:-0}
+
+    desc=$(pci_describe "${bdf}" "${LSPCI}")
+
+    if [[ ${f} -gt 0 || ${nf} -gt 0 ]]; then
+      crit_bdfs=$((crit_bdfs + 1))
+      crit_msg "PCIe ${desc}: ${f} FATAL, ${nf} NON-FATAL uncorrectable AER error(s) recorded. This is a serious link/device fault." 2
+    elif [[ ${c} -gt 0 ]]; then
+      warn_bdfs=$((warn_bdfs + 1))
+      local rp_note=""
+      if [[ -n ${rp_cor[${bdf}]:-} && ${rp_cor[${bdf}]} -gt ${c} ]]; then
+        rp_note=" Root port total (${rp_cor[${bdf}]}) exceeds its own count - downstream device(s) on this port's secondary bus are also logging correctable errors; inspect the devices behind it."
+      fi
+      warn_msg "PCIe ${desc}: ${c} correctable AER error(s) recorded (eg. RxErr/BadTLP/Rollover).${rp_note}" 2
+    fi
+  done
+
+  if [[ ${crit_bdfs} -gt 0 ]]; then
+    rule_result CRITICAL "${crit_bdfs} of ${ndev} PCIe device(s) have logged FATAL/NON-FATAL (uncorrectable) AER errors. See details above."
+  elif [[ ${warn_bdfs} -gt 0 ]]; then
+    rule_result WARNING "${warn_bdfs} of ${ndev} PCIe device(s) have logged correctable AER errors. The link recovers automatically, but repeated correctable errors are a precursor to link degradation and can impact throughput/latency of anything behind that port (NVMe, CXL, GPU, NIC). See details above."
+  else
+    rule_result PASSED "All ${ndev} PCIe device(s) with AER counters report zero correctable/uncorrectable errors."
+  fi
+}
+
+pcie_aer_error_counters "${OUTPUT_PATH}/pcie_aer_counters" "${OUTPUT_PATH}/lspci"
+
+set +x

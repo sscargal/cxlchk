@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_STORAGE_SMART_OVERALL_HEALTH_}" ]; then
+  return
+fi
+_MODULE_CHECK_STORAGE_SMART_OVERALL_HEALTH_="Loaded"
+
+# Check smartctl's own PASSED/FAILED verdict ('SMART overall-health self-assessment test
+# result') for every collected SATA/SAS/NVMe device (collector/modules/storage runs
+# 'smartctl -a' against everything 'smartctl --scan' reports). This is the drive firmware's own
+# summary judgement and covers SAS/SATA drives that the NVMe-specific rules in this module do
+# not (those parse 'nvme smart-log' directly).
+function storage_smart_overall_health() {
+  local FNAME_GLOB="${OUTPUT_PATH}/smartctl_-a_*"
+  local fname devname result
+  local ndev=0 bad=0 matched=0
+
+  for fname in ${FNAME_GLOB}; do
+    [[ -f ${fname} && ${fname} != *.err ]] || continue
+
+    result=$(${GREP} -iE "overall-health self-assessment test result" "${fname}")
+    # Devices smartctl can't run a health self-assessment against (eg. some RAID passthrough,
+    # or the SMART capability is disabled) print no such line - nothing to evaluate for those.
+    [[ -z ${result} ]] && continue
+
+    matched=1
+    ndev=$((ndev + 1))
+    devname="$(basename "${fname}")"
+    devname="${devname#smartctl_-a_}"
+
+    if ${GREP} -qiE "test result:[[:space:]]*PASSED" <<< "${result}"; then
+      :
+    else
+      bad=$((bad + 1))
+      crit_msg "${devname}: ${result}" 2
+    fi
+  done
+
+  if [[ ${matched} -eq 0 ]]; then
+    rule_result SKIPPED "No 'smartctl_-a_*' files with a parseable overall-health result found in '${OUTPUT_PATH}'. smartmontools not installed, or no devices reported by 'smartctl --scan'."
+    return
+  fi
+
+  if [[ ${bad} -gt 0 ]]; then
+    rule_result CRITICAL "${bad} of ${ndev} device(s) FAILED smartctl's overall-health self-assessment. See details above - the drive itself is reporting an imminent-failure condition."
+  else
+    rule_result PASSED "All ${ndev} device(s) PASSED smartctl's overall-health self-assessment."
+  fi
+}
+
+storage_smart_overall_health
+
+set +x

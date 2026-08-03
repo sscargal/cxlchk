@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_STORAGE_NVME_TEMPERATURE_THRESHOLDS_}" ]; then
+  return
+fi
+_MODULE_CHECK_STORAGE_NVME_TEMPERATURE_THRESHOLDS_="Loaded"
+
+# Check the NVMe SMART log's cumulative "time spent above a temperature threshold" counters
+# rather than the instantaneous 'temperature' reading. A single snapshot can't distinguish a
+# drive that is momentarily warm under load from one that is chronically overheating, but these
+# counters (minutes accumulated over the drive's life) can. nvme-cli has used both a
+# snake_case ('warning_temp_time'/'critical_comp_time') and a human-readable ('Warning
+# Temperature Time'/'Critical Composite Temperature Time') field name across versions, so both
+# are matched.
+function storage_nvme_temperature_thresholds() {
+  local FNAME_GLOB="${OUTPUT_PATH}/nvme_smart-log_*"
+  local fname devname wtime ctime
+  local ndev=0 crit=0 warned=0 matched=0
+
+  for fname in ${FNAME_GLOB}; do
+    [[ -f ${fname} && ${fname} != *.err ]] || continue
+    matched=1
+    ndev=$((ndev + 1))
+    devname="$(basename "${fname}")"
+    devname="${devname#nvme_smart-log_}"
+
+    wtime=$(${GREP} -iE "^(warning_temp_time|warning temperature time)[[:space:]]*:" "${fname}" | ${GREP} -oE "[0-9]+" | head -1)
+    ctime=$(${GREP} -iE "^(critical_comp_time|critical composite temperature time)[[:space:]]*:" "${fname}" | ${GREP} -oE "[0-9]+" | head -1)
+    # Default to 0 and normalize away any leading zero - bash arithmetic otherwise treats a
+    # zero-padded value as (possibly invalid) octal.
+    wtime=$((10#${wtime:-0}))
+    ctime=$((10#${ctime:-0}))
+
+    if [[ ${ctime} -gt 0 ]]; then
+      crit=$((crit + 1))
+      crit_msg "${devname}: has spent ${ctime} minute(s) above its critical composite temperature threshold." 2
+    elif [[ ${wtime} -gt 0 ]]; then
+      warned=$((warned + 1))
+      warn_msg "${devname}: has spent ${wtime} minute(s) above its warning temperature threshold." 2
+    fi
+  done
+
+  if [[ ${matched} -eq 0 ]]; then
+    rule_result SKIPPED "No 'nvme_smart-log_*' files found in '${OUTPUT_PATH}'. nvme-cli not installed, or no NVMe controllers present."
+    return
+  fi
+
+  if [[ ${crit} -gt 0 ]]; then
+    rule_result CRITICAL "${crit} of ${ndev} NVMe controller(s) have accumulated time above their critical temperature threshold. Check airflow/cooling for the affected slot(s)."
+  elif [[ ${warned} -gt 0 ]]; then
+    rule_result WARNING "${warned} of ${ndev} NVMe controller(s) have accumulated time above their warning temperature threshold. See details above."
+  else
+    rule_result PASSED "All ${ndev} NVMe controller(s) report zero time above their warning/critical temperature thresholds."
+  fi
+}
+
+storage_nvme_temperature_thresholds
+
+set +x

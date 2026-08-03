@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_PCIE_DPC_TRIGGERED_}" ]; then
+  return
+fi
+_MODULE_CHECK_PCIE_DPC_TRIGGERED_="Loaded"
+
+# Downstream Port Containment (DPC) is enabled on most modern root ports (visible in dmesg as
+# "DPC: enabled with IRQ N" plus a one-time "error containment capabilities" line at boot/probe
+# time - both benign, just the driver announcing the feature is available). If DPC actually
+# TRIGGERS, the port has forced its downstream link down to contain an uncorrectable error,
+# which drops every device behind it (NVMe, CXL, GPU, NIC, ...) off the bus until it recovers/
+# is re-enumerated. That is a severe, service-impacting event and is reported here separately
+# from the "enabled" announcement.
+function pcie_dpc_triggered_events() {
+  local FNAME=$1        # 'dmesg -T' file
+  local LSPCI=$2        # Collected 'lspci' file, used only to describe a BDF in human terms
+  local hits=0
+  local evt bdf desc
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]]; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # "DPC: enabled" / "DPC: error containment capabilities" are benign one-time driver-probe
+  # announcements, not triggered events - exclude them explicitly.
+  hits=$(${GREP} -iE "DPC:" ${FNAME} | ${GREP} -vE "DPC: enabled|error containment capabilities" | ${GREP} -icE "containment event|unmasked uncorrectable error|trigger reason")
+
+  if [[ ${hits} -gt 0 ]]; then
+    while read -r evt; do
+      # Pull the BDF (eg. "0000:d3:08.0") out of the kernel log line so the affected root port
+      # can be identified in human terms, not just by address.
+      bdf=$(${GREP} -oE "[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]" <<< "${evt}" | head -1)
+      if [[ -n ${bdf} ]]; then
+        desc=$(pci_describe "${bdf}" "${LSPCI}")
+        crit_msg "${evt} [${desc}]" 2
+      else
+        crit_msg "${evt}" 2
+      fi
+    done <<< "$(${GREP} -iE "DPC:" ${FNAME} | ${GREP} -vE "DPC: enabled|error containment capabilities" | ${GREP} -iE "containment event|unmasked uncorrectable error|trigger reason")"
+    rule_result CRITICAL "PCIe Downstream Port Containment (DPC) triggered ${hits} time(s). The affected root port forced its link down to contain an uncorrectable error - every device behind it was dropped from the bus. See details above and correlate with the AER/error-log rules for the same BDF."
+  else
+    rule_result PASSED "No PCIe DPC containment-triggered events found in dmesg."
+  fi
+}
+
+pcie_dpc_triggered_events "${OUTPUT_PATH}/dmesg_-T" "${OUTPUT_PATH}/lspci"
+
+set +x

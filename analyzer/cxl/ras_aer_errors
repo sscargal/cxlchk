@@ -16,6 +16,7 @@ function cxl_ras_aer_errors() {
   local DMESG=$1          # 'dmesg -T' file
   local LSPCI=$2          # 'lspci' file (used to find CXL BDFs)
   local bdf=""            # A single CXL device BDF while looping
+  local desc=""           # Human-readable description of ${bdf}, from pci_describe()
   local nbdf=0            # Number of CXL BDFs found
   local crit=0            # Uncorrected/Fatal AER events correlated to a CXL BDF
   local warn=0            # Corrected AER events correlated to a CXL BDF
@@ -35,13 +36,14 @@ function cxl_ras_aer_errors() {
   while read -r bdf; do
     [[ -z ${bdf} ]] && continue
     nbdf=$((nbdf + 1))
+    desc=$(pci_describe "${bdf}" "${LSPCI}")
     # AER lines reference the BDF; classify severity of any matching event
     if ${GREP} -E "${bdf}" ${DMESG} | ${GREP} -qE "Uncorrected|Fatal"; then
       crit=$((crit + 1))
-      info_msg "$(${GREP} -E "${bdf}" ${DMESG} | ${GREP} -m1 -E "Uncorrected|Fatal")" 2
+      info_msg "${desc}: $(${GREP} -E "${bdf}" ${DMESG} | ${GREP} -m1 -E "Uncorrected|Fatal")" 2
     elif ${GREP} -E "${bdf}" ${DMESG} | ${GREP} -q "Corrected"; then
       warn=$((warn + 1))
-      info_msg "$(${GREP} -E "${bdf}" ${DMESG} | ${GREP} -m1 "Corrected")" 2
+      info_msg "${desc}: $(${GREP} -E "${bdf}" ${DMESG} | ${GREP} -m1 "Corrected")" 2
     fi
   done <<< "$(${GREP} -i CXL ${LSPCI} | ${AWK} '{print $1}')"
 
