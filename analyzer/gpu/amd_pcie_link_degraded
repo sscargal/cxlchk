@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_AMD_PCIE_LINK_DEGRADED_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_AMD_PCIE_LINK_DEGRADED_="Loaded"
+
+# Check whether any AMD Instinct GPU's PCIe link trained at a lower speed/width than it is
+# capable of, using lspci -vv's own "(downgraded)" annotation on the LnkSta: line - the same
+# mechanism cxl_link_degraded uses for CXL devices. Unlike the NVIDIA gpu_pcie_link_degraded
+# rule (which distinguishes width vs speed degradation and corroborates speed drops with dmesg,
+# because NVIDIA GPUs intentionally downtrain speed when idle), this is a simpler check: AMD
+# Instinct accelerators are always-on compute GPUs, and lspci itself already decides what
+# counts as "downgraded" for both speed and width.
+function gpu_amd_pcie_link_degraded() {
+  local FNAME=$1        # 'lspci -vv' output
+  local res             # Matched 'LnkSta:.*downgraded' lines, if any
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  if ! ${GREP} -q "Instinct" "${FNAME}"; then
+    rule_result SKIPPED "No AMD Instinct GPU found in '${FNAME}'."
+    return
+  fi
+
+  # Extract the lspci -vv block for each AMD Instinct GPU (from the 'Instinct' line to the
+  # next blank line) and look for lspci's own '(downgraded)' annotation on the LnkSta: line.
+  res=$(${AWK} '/Instinct/{f=1} f{print} /^$/{f=0}' "${FNAME}" | ${GREP} -i "LnkSta:.*downgraded")
+  case "$?" in
+    0)
+      while read -r line; do
+        info_msg "${line}" 2
+      done <<< "${res}"
+      rule_result FAILED "One or more AMD Instinct GPUs have a PCIe link that trained at a lower speed/width than it is capable of (see 'lspci -vv')!"
+      ;;
+    1)
+      rule_result PASSED "No AMD Instinct GPUs were found with a degraded PCIe link speed/width."
+      ;;
+    *)
+      rule_result SKIPPED "Failed to process '${FNAME}' looking for degraded AMD Instinct GPU PCIe links!"
+      ;;
+  esac
+}
+
+# Call the main function
+gpu_amd_pcie_link_degraded "${OUTPUT_PATH}/lspci_-vv"
+
+set +x

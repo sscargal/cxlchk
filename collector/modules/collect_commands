@@ -44,6 +44,8 @@ function collect_cmds() {
     "nvidia-smi -q"
     "/usr/local/cuda/gds/tools/gdscheck -p"
     "nvidia-smi --query-gpu=index,pci.bus_id,pcie.link.gen.max,pcie.link.gen.current,pcie.link.width.max,pcie.link.width.current --format=csv,noheader"
+    "amd-smi list --csv"
+    "rocm-smi --showbus --csv"
   )
 
   # Initialize the progress bar

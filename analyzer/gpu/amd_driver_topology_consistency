@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_AMD_DRIVER_TOPOLOGY_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_AMD_DRIVER_TOPOLOGY_="Loaded"
+
+# Check that ROCm (amd-smi, falling back to the older rocm-smi) is binding every AMD Instinct
+# GPU present on the PCI bus. This is the AMD analog of gpu_driver_cuda_consistency, but matches
+# on PCI bus:device.function (BDF) rather than just comparing counts, since both amd-smi and
+# rocm-smi report the BDF of every GPU they manage - an exact BDF match is more precise than a
+# count comparison and avoids ambiguity if other AMD PCI functions (eg. audio/USB) are present.
+#
+# Note: amd-smi/rocm-smi output formatting varies across ROCm versions, and neither tool was
+# available to validate this rule against real output, so BDFs are located anywhere in the file
+# via a PCI BDF regex rather than by parsing fixed columns - this is deliberately tolerant of
+# format differences (CSV vs plain-text, domain-qualified vs not) between tool/ROCm versions.
+function gpu_amd_driver_topology_consistency() {
+  local LSPCI=$1          # 'lspci -vv' output, used to find AMD Instinct GPU BDFs
+  local AMDSMI=$2         # 'amd-smi list --csv' output (preferred)
+  local ROCMSMI=$3        # 'rocm-smi --showbus --csv' output (fallback)
+  local SMI_FILE=""       # Whichever of the above is usable
+  local SMI_TOOL=""       # Name of the tool actually used, for messages
+  local lspci_bdfs=""     # AMD Instinct GPU BDFs found via lspci (one per line, lowercase)
+  local smi_bdfs=""       # BDFs found in the SMI tool's output (one per line, lowercase)
+  local total=0           # Number of AMD Instinct GPUs found via lspci
+  local missing=""        # BDFs present in lspci but not reported by the SMI tool
+  local missing_count=0   # Count of the above
+  local bdf               # Single BDF while looping
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${LSPCI} ]] ; then
+    rule_result SKIPPED "Could not process '${LSPCI}'. File not found"
+    return
+  fi
+
+  lspci_bdfs=$(${AWK} '
+    /^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]/ {
+      if ($0 ~ /Advanced Micro Devices, Inc\. \[AMD\/ATI\]/ && $0 ~ /Instinct/) print tolower($1)
+    }
+  ' "${LSPCI}")
+
+  if [[ -z ${lspci_bdfs} ]]; then
+    rule_result SKIPPED "No AMD Instinct GPU found in '${LSPCI}'."
+    return
+  fi
+  total=$(${GREP} -c . <<< "${lspci_bdfs}")
+
+  if [[ -s ${AMDSMI} ]]; then
+    SMI_FILE=${AMDSMI}
+    SMI_TOOL="amd-smi"
+  elif [[ -s ${ROCMSMI} ]]; then
+    SMI_FILE=${ROCMSMI}
+    SMI_TOOL="rocm-smi"
+  else
+    rule_result SKIPPED "Neither '${AMDSMI}' nor '${ROCMSMI}' produced output - install/run amd-smi or rocm-smi (ROCm userspace tools) to verify all ${total} AMD Instinct GPU(s) found via lspci are bound to the amdgpu driver."
+    return
+  fi
+
+  # Pull every PCI BDF (bus:device.function; a domain prefix, if present, is not matched by
+  # this pattern and is naturally excluded) out of the SMI tool's output.
+  smi_bdfs=$(${GREP} -oE '[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]' "${SMI_FILE}" | tr 'A-F' 'a-f' | sort -u)
+
+  while read -r bdf; do
+    [[ -z ${bdf} ]] && continue
+    if ! ${GREP} -qx "${bdf}" <<< "${smi_bdfs}"; then
+      missing+="${bdf} "
+      missing_count=$((missing_count+1))
+    fi
+  done <<< "${lspci_bdfs}"
+
+  if (( missing_count > 0 )); then
+    rule_result FAILED "${SMI_TOOL} does not report ${missing_count}/${total} AMD Instinct GPU BDF(s) found via lspci: ${missing}. These GPU(s) are not bound to the amdgpu driver (missing/failed driver init, or bound to vfio-pci)."
+    return
+  fi
+
+  rule_result PASSED "${SMI_TOOL} reports all ${total} AMD Instinct GPU BDF(s) found on the PCI bus; the amdgpu driver is binding every GPU."
+}
+
+# Call the main function
+gpu_amd_driver_topology_consistency "${OUTPUT_PATH}/lspci_-vv" "${OUTPUT_PATH}/amd-smi_list_--csv" "${OUTPUT_PATH}/rocm-smi_--showbus_--csv"
+
+set +x
