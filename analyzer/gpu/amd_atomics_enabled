@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_GPU_AMD_ATOMICS_}" ]; then
+  return
+fi
+_MODULE_CHECK_GPU_AMD_ATOMICS_="Loaded"
+
+# Check whether the PCIe AtomicOp Requester Enable bit (DevCtl2 -> "AtomicOpsCtl: ReqEn") is set
+# for every AMD Instinct GPU (eg. MI300X, MI350X) found in 'lspci -vv'. ROCm requires this bit
+# for RDMA/P2P and some unified-memory code paths; if it is off, the GPU cannot issue AtomicOp
+# TLPs and those paths silently fail or fall back to a slower mechanism. Reference:
+# https://instinct.docs.amd.com/projects/amdgpu-docs/en/latest/conceptual/pcie-atomics.html
+#
+# 'lspci -vv' reports two related things per PCIe function:
+#   DevCap2 -> "AtomicOpsCap: 32bit+/- 64bit+/- 128bitCAS+/-"  (what the port/device SUPPORTS)
+#   DevCtl2 -> "AtomicOpsCtl: ReqEn+/-"                        (whether AtomicOp REQUESTS are on)
+# This rule checks the requester bit (ReqEn) on every AMD Instinct GPU function and requires it
+# to be enabled consistently across all of them - PASS only if every GPU has ReqEn+.
+#
+# Completer/routing (the "sender" side of the caveat): for an AtomicOp request to actually
+# complete, every upstream root port/switch between the GPU and its target (host memory,
+# another GPU, etc.) must also support routing/completing the operation. That is DevCap2's
+# AtomicOpsCap on THAT port - there is no separate "enable" bit for a port that only completes
+# or routes atomics, so it can't be flipped on/off like ReqEn; it's a fixed hardware capability.
+# This rule additionally scans every PCIe bridge/root/switch port in the same capture and
+# reports (INFO/WARNING only - it does not change the PASS/FAIL verdict, which is about the
+# GPU's own enable bit) whether any of them fail to advertise AtomicOpsCap support, since that
+# would silently block atomics end-to-end even with every GPU's requester bit enabled.
+function gpu_amd_atomics_enabled() {
+  local FNAME=$1             # 'lspci -vv' output
+  local ATOMICS_DOC_URL="https://instinct.docs.amd.com/projects/amdgpu-docs/en/latest/conceptual/pcie-atomics.html"
+  local total_gpus=0         # AMD Instinct GPU functions with a parseable AtomicOpsCtl
+  local enabled_gpus=0       # ... of which report AtomicOpsCtl: ReqEn+
+  local port_count=0         # Upstream bridge/root/switch ports with AtomicOpsCap reported
+  local port_cap_count=0     # ... of which advertise 32bit+ or 64bit+ (routing/completion capable)
+
+  # Exit the function with a SKIPPED message if the file to process doesn't exist
+  if [[ ! -f ${FNAME} ]] ; then
+    rule_result SKIPPED "Could not process '${FNAME}'. File not found"
+    return
+  fi
+
+  # AWK program (shared by the detail pass and the count passes) that, statefully within each
+  # AMD Instinct GPU device record, extracts DevCap2's AtomicOpsCap flags and DevCtl2's
+  # AtomicOpsCtl ReqEn flag.
+  local gpu_prog='
+    /^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]/ {
+      is_gpu = ($0 ~ /Advanced Micro Devices, Inc\. \[AMD\/ATI\]/ && $0 ~ /Instinct/) ? 1 : 0
+      hdr = $1
+      cap = ""
+      next
+    }
+    is_gpu && /AtomicOpsCap:/ {
+      c = $0; sub(/^.*AtomicOpsCap: */, "", c); gsub(/^ +| +$/, "", c)
+      cap = c
+    }
+    is_gpu && /AtomicOpsCtl:/ {
+      if (match($0, /ReqEn[+-]/)) {
+        reqen = substr($0, RSTART, RLENGTH)
+        emit(hdr, cap, reqen)
+      }
+    }
+  '
+
+  # Detail pass: one line per AMD Instinct GPU PCIe function found
+  local gpu_detail
+  gpu_detail="$(${AWK} "function emit(h,c,r){printf \"GPU %s: AtomicOpsCap %s | AtomicOpsCtl: %s\n\", h, c, r} ${gpu_prog}" "${FNAME}")"
+  if [[ -n ${gpu_detail} ]]; then
+    while read -r line; do
+      info_msg "${line}" 2
+    done <<< "${gpu_detail}"
+  fi
+
+  total_gpus=$(${AWK} "function emit(h,c,r){cnt++} ${gpu_prog} END{print cnt+0}" "${FNAME}")
+  enabled_gpus=$(${AWK} "function emit(h,c,r){if (r == \"ReqEn+\") cnt++} ${gpu_prog} END{print cnt+0}" "${FNAME}")
+
+  if (( total_gpus == 0 )); then
+    rule_result SKIPPED "No AMD Instinct GPU PCIe function with a parseable AtomicOpsCtl was found in '${FNAME}'."
+    return
+  fi
+
+  # Completer/routing side: scan every bridge/root/switch port for AtomicOpsCap support.
+  # Informational only - there is no per-port "enable" bit, only a fixed capability.
+  local port_prog='
+    /^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]/ {
+      is_port = ($0 ~ /PCI bridge/ || $0 ~ /Root Port/ || $0 ~ /Downstream Port/ || $0 ~ /Upstream Port/) ? 1 : 0
+      next
+    }
+    is_port && /AtomicOpsCap:/ {
+      seen++
+      if ($0 ~ /32bit\+/ || $0 ~ /64bit\+/) cap++
+    }
+    END { printf "%d %d\n", seen+0, cap+0 }
+  '
+  read -r port_count port_cap_count <<< "$(${AWK} "${port_prog}" "${FNAME}")"
+
+  if (( port_count == 0 )); then
+    info_msg "No PCIe bridge/root/switch port AtomicOpsCap fields were found in '${FNAME}' - cannot confirm upstream routing/completion support for atomics." 2
+  elif (( port_cap_count == 0 )); then
+    warn_msg "None of the ${port_count} upstream PCIe bridge/root/switch port(s) advertise AtomicOps routing/completion support (all report 32bit- 64bit-). Even with the GPU's AtomicOp Requester Enable set, atomics may not complete end-to-end. See ${ATOMICS_DOC_URL}" 2
+  else
+    info_msg "${port_cap_count}/${port_count} upstream PCIe bridge/root/switch port(s) advertise AtomicOps routing/completion support (32bit+/64bit+)." 2
+  fi
+
+  if (( enabled_gpus == total_gpus )); then
+    rule_result PASSED "AtomicOp Requester Enable (AtomicOpsCtl: ReqEn+) is set on all ${total_gpus} AMD Instinct GPU PCIe function(s). See ${ATOMICS_DOC_URL}"
+  elif (( enabled_gpus == 0 )); then
+    rule_result FAILED "AtomicOp Requester Enable (AtomicOpsCtl: ReqEn-) is NOT set on any of the ${total_gpus} AMD Instinct GPU PCIe function(s). PCIe atomics are disabled; ROCm workloads relying on them (RDMA/P2P, some unified-memory paths) may fail or fall back to a slower mechanism. See ${ATOMICS_DOC_URL}"
+  else
+    rule_result FAILED "AtomicOp Requester Enable is inconsistent across AMD Instinct GPUs: only ${enabled_gpus}/${total_gpus} have ReqEn+ (see per-GPU detail above). All GPUs must have matching PCIe atomics settings. See ${ATOMICS_DOC_URL}"
+  fi
+}
+
+# Call the main function
+gpu_amd_atomics_enabled "${OUTPUT_PATH}/lspci_-vv"
+
+set +x
