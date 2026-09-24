@@ -65,6 +65,7 @@ linux/full_file_system
 analyzer/linux/memmap
 analyzer/cxl/find_devices
 analyzer/cxl/offline_mem_blocks
+analyzer/cxl/register_locator_dvsec
 [...snip...]
 ```
 

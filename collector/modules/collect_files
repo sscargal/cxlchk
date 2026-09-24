@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 #################################################################################################
 # Collect files from the target system
 #################################################################################################
@@ -28,7 +29,7 @@ function collect_files() {
   # Initialize the progress bar
   init_progressbar "${#files_to_collect[@]}"
 
-  for file in ${files_to_collect[@]}; do
+  for file in "${files_to_collect[@]}"; do
     # Provide progress to user
     inc_progressbar
 

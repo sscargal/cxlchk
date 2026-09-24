@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# set -x
+# Prevent repeated sourcing
+if [ -n "${_MODULE_CHECK_CXL_REGISTER_LOCATOR_DVSEC_}" ]; then
+  return
+fi
+_MODULE_CHECK_CXL_REGISTER_LOCATOR_DVSEC_="Loaded"
+
+# Some CXL memory endpoints do not implement the CXL Register Locator DVSEC
+# (CXL vendor 1e98, DVSEC ID 0x0008). The known case is Liqid enclosures built
+# on the XConn XC50256 "Apollo I" switch (PCI 1f16:c500). Without that DVSEC
+# the CXL driver cannot find the device's component/HDM/mailbox registers, so
+# it never creates a memdev or endpoint decoder and never assembles a region.
+# On Linux 6.x the Soft Reserved (EFI_MEMORY_SP) range was then claimed by
+# dax_hmem and DAX devices were created; on Linux >= 7.0 the upstream series
+# "[PATCH v8 0/9] dax/hmem, cxl: Coordinate Soft Reserved handling with CXL
+# and HMEM" (https://lkml.iu.edu/hypermail/linux/kernel/2603.2/13783.html)
+# gives CXL first right of refusal over Soft Reserved ranges inside a CFMWS
+# window, and the "region assembly failed -> give the range back to HMEM"
+# fallback is not merged, so the range is claimed but never assembled and no
+# DAX device is ever created. Validated workarounds: a kernel command line
+# containing module_blacklist=cxl_acpi,cxl_pci,cxl_port,cxl_mem (all four,
+# built as modules; cxl_core must NOT be listed - dax_hmem depends on it), or
+# a kernel built with CONFIG_CXL_REGION not set. See Liqid KB LQD-KB-XXXX.
+# Note: no dmesg matching is done for the failure itself - the kernel's
+# CXL/HMEM claim messages for this scenario are dev_dbg only and are not
+# visible in a default dmesg.
+
+# Look up the 'vendor:device' ID for a PCI BDF in 'lspci -nn' output.
+# arg1 = path to the 'lspci -nn' file, arg2 = BDF (short or full domain form)
+# Echoes the vendor:device ID, or nothing if not found
+function cxl_register_locator_dvsec_nn_id() {
+  local nn_file=$1
+  local bdf=$2
+  local line=""
+
+  line=$(${GREP} -m1 -E "^${bdf}[[:space:]]" "${nn_file}")
+  # lspci -nn omits an all-zero domain; retry with the short form
+  if [[ -z ${line} && ${bdf} == 0000:* ]]; then
+    line=$(${GREP} -m1 -E "^${bdf#*:}[[:space:]]" "${nn_file}")
+  fi
+  # The numeric ID is the bracketed [vvvv:dddd] field at the end of the line
+  if [[ -n ${line} && ${line} =~ \[([0-9a-fA-F]{4}:[0-9a-fA-F]{4})\] ]]; then
+    echo "${BASH_REMATCH[1]}"
+  fi
+  return 0
+}
+
+# Check whether a list of items contains a given item
+# arg1 = item, arg2..N = list items
+function cxl_register_locator_dvsec_list_contains() {
+  local item=$1
+  shift
+  local e
+  for e in "$@"; do
+    if [[ ${e} == "${item}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Classify one parsed lspci -vv device block
+# arg1 = block contains the CXL DVSEC 'Vendor=1e98 ID=0000' (1/0)
+# arg2 = block has a 'CXLCap:' line with 'Mem+' (1/0)
+# arg3 = block contains the Register Locator DVSEC 'Vendor=1e98 ID=0008' (1/0)
+# Echoes 'affected', 'ok', or 'none'
+function cxl_register_locator_dvsec_classify_block() {
+  if [[ $1 == "1" && $2 == "1" ]]; then
+    if [[ $3 == "1" ]]; then
+      echo "ok"
+    else
+      echo "affected"
+    fi
+  else
+    echo "none"
+  fi
+  return 0
+}
+
+# Find CXL memory devices that lack the CXL Register Locator DVSEC and, on
+# Linux >= 7.0 kernels, evaluate the workaround state (see header comment).
+function cxl_register_locator_dvsec() {
+  local LSPCI_VV=$1        # 'lspci -vv' output (device blocks, DVSECs)
+  local UNAME=$2           # 'uname -a' output (kernel release)
+  local CMDLINE=$3         # /proc/cmdline (module_blacklist=)
+  local LSPCI_NN=$4        # 'lspci -nn' output (readable vendor:device IDs) - optional
+  local KCONFIG=$5         # kernel config - optional
+  local LSMOD=$6           # 'lsmod' output - optional
+  local PLATFORM=$7        # 'ls -l /sys/bus/platform/devices/' (hmem.N) - optional
+  local DAXCTL_LIST=$8     # 'daxctl list' JSON - optional
+  local DMESG=$9           # 'dmesg -T' (RCH host bridge detection) - optional
+
+  local KB_ID="LQD-KB-XXXX"
+
+  # The required input is the lspci -vv dump
+  if [[ ! -f ${LSPCI_VV} ]]; then
+    rule_result SKIPPED "Could not process '${LSPCI_VV}'. File not found"
+    return
+  fi
+
+  ##################################################################################################################
+  # Step A: find CXL.mem devices lacking the Register Locator DVSEC (1e98 ID 0008)
+  #
+  # Parse lspci -vv into per-device blocks. A block starts at a non-indented
+  # 'BB:DD.F' (or 'DDDD:BB:DD.F') line and ends at the next such line or a
+  # blank line. A device is a CXL.mem device if its block has the CXL DVSEC
+  # (Vendor=1e98 ID=0000) and a CXLCap: line with 'Mem+'; it is affected if it
+  # also has no Register Locator DVSEC (Vendor=1e98 ID=0008).
+  #
+  # Pass 1: split into blocks (stored as 'BDF has_cxldvsec has_mem has_regloc').
+  # Pass 2: classify each block.
+  ##################################################################################################################
+  local vv_lines=()
+  mapfile -t vv_lines < "${LSPCI_VV}"
+  local line bdf
+  local in_block=0
+  local cur_bdf="" c_cxldvsec=0 c_mem=0 c_regloc=0
+  local blocks=()
+
+  for line in "${vv_lines[@]}"; do
+    if [[ ${line} =~ ^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F][[:space:]] ]]; then
+      # A new device block starts; flush the previous one
+      if [[ ${in_block} -eq 1 ]]; then
+        blocks+=("${cur_bdf} ${c_cxldvsec} ${c_mem} ${c_regloc}")
+      fi
+      in_block=1
+      cur_bdf=${line%% *}
+      c_cxldvsec=0
+      c_mem=0
+      c_regloc=0
+    elif [[ -z ${line} ]]; then
+      # A blank line ends the current block
+      if [[ ${in_block} -eq 1 ]]; then
+        blocks+=("${cur_bdf} ${c_cxldvsec} ${c_mem} ${c_regloc}")
+        in_block=0
+      fi
+    elif [[ ${in_block} -eq 1 ]]; then
+      # Accumulate the block contents
+      if [[ ${line} =~ Vendor=1e98[[:space:]]+ID=0000 ]]; then
+        c_cxldvsec=1
+      fi
+      if [[ ${line} =~ CXLCap:.*Mem\+ ]]; then
+        c_mem=1
+      fi
+      if [[ ${line} =~ Vendor=1e98[[:space:]]+ID=0008 ]]; then
+        c_regloc=1
+      fi
+    fi
+  done
+  # Flush the final block (EOF, no trailing blank line)
+  if [[ ${in_block} -eq 1 ]]; then
+    blocks+=("${cur_bdf} ${c_cxldvsec} ${c_mem} ${c_regloc}")
+  fi
+
+  local entry has_cxldvsec has_mem has_regloc nn_id
+  local cxlmem_count=0
+  local compliant_bdfs="" affected_bdfs="" affected_display=""
+  for entry in "${blocks[@]}"; do
+    read -r bdf has_cxldvsec has_mem has_regloc <<< "${entry}"
+    case $(cxl_register_locator_dvsec_classify_block "${has_cxldvsec}" "${has_mem}" "${has_regloc}") in
+      "ok")
+        cxlmem_count=$((cxlmem_count+1))
+        compliant_bdfs+="${bdf} "
+        ;;
+      "affected")
+        cxlmem_count=$((cxlmem_count+1))
+        affected_bdfs+="${bdf} "
+        affected_display+="${bdf}"
+        if [[ -f ${LSPCI_NN} ]]; then
+          nn_id=$(cxl_register_locator_dvsec_nn_id "${LSPCI_NN}" "${bdf}")
+          if [[ -n ${nn_id} ]]; then
+            affected_display+=" (${nn_id})"
+          fi
+        fi
+        affected_display+=" "
+        ;;
+    esac
+  done
+
+  # No CXL.mem devices at all - nothing for this rule to check
+  if [[ ${cxlmem_count} -eq 0 ]]; then
+    rule_result SKIPPED "no CXL.mem devices found in 'lspci_-vv'. Nothing to check. See ${KB_ID}"
+    return
+  fi
+
+  # Every CXL.mem device implements the Register Locator DVSEC
+  if [[ -z ${affected_bdfs} ]]; then
+    rule_result PASSED "All ${cxlmem_count} CXL.mem device(s) implement the CXL Register Locator DVSEC (1e98:0008): ${compliant_bdfs}. See ${KB_ID}"
+    return
+  fi
+
+  ##################################################################################################################
+  # Step B: kernel version (major.minor of the release field of 'uname -a',
+  # handles suffixes such as 7.2.0-rc6 / 7.1.8-200.fc44.x86_64 / 6.14.0-...)
+  ##################################################################################################################
+  if [[ ! -f ${UNAME} ]]; then
+    rule_result SKIPPED "Could not process '${UNAME}'. File not found"
+    return
+  fi
+  local release=""
+  local _uname_arch _uname_name _uname_rest
+  read -r _uname_arch _uname_name release _uname_rest < "${UNAME}"
+  if ! [[ ${release} =~ ^([0-9]+)\.([0-9]+) ]]; then
+    rule_result SKIPPED "Could not parse the kernel release '${release}' from '${UNAME}'"
+    return
+  fi
+  local major
+  major=${BASH_REMATCH[1]}
+  local is_ge_70=0
+  if [[ ${major} -ge 7 ]]; then
+    is_ge_70=1
+  fi
+
+  ##################################################################################################################
+  # Supporting state
+  #
+  # RCH/RCD: the kernel logs 'host supports CXL (restricted)' (dev_info in
+  # drivers/cxl/acpi.c) once per Restricted CXL Host host bridge. CXL 1.1 RCDs
+  # locate component registers through the RCRB and the Register Locator DVSEC
+  # is optional for them, so on an RCH host the finding is downgraded to INFO.
+  # When an RCH host bridge cannot be identified, the RCD caveat is mentioned
+  # in the message instead of guessing.
+  ##################################################################################################################
+  local rcd_caveat="Note: on a Restricted CXL Host (RCH), CXL 1.1 RCDs locate component registers through the RCRB and the Register Locator DVSEC is optional for them - if the affected device is an RCD this finding may be expected. "
+  local rch_detected=0
+  if [[ -f ${DMESG} ]] && ${GREP} -q "host supports CXL (restricted)" "${DMESG}"; then
+    rch_detected=1
+  fi
+
+  # Is a DAX device present (hmem.N platform device or a non-empty 'daxctl list')?
+  local dax_present=0
+  local notes=""
+  if [[ -f ${PLATFORM} ]]; then
+    if ${GREP} -qE "[[:space:]]hmem\.[0-9]+([[:space:]]|$)" "${PLATFORM}"; then
+      dax_present=1
+    fi
+  else
+    notes+="platform device listing not collected; "
+  fi
+  if [[ -f ${DAXCTL_LIST} ]]; then
+    if ${GREP} -q '"chardev"' "${DAXCTL_LIST}"; then
+      dax_present=1
+    fi
+  else
+    notes+="daxctl list not collected; "
+  fi
+
+  ##################################################################################################################
+  # Workaround state: module_blacklist= on the kernel command line
+  #
+  # In Linux >= 7.0 module_blacklist is a core_param(charp) - a comma-separated
+  # list of module names (kernel/module/main.c) - and parse_args() processes
+  # the command line left to right, each occurrence overwriting the previous
+  # one (param_set_charp in kernel/params.c). The LAST 'module_blacklist='
+  # token therefore wins, and all four modules must be listed in that one token.
+  ##################################################################################################################
+  local have_blacklist=0
+  local blacklist=""
+  local bl_modules=()
+  local m
+  local has_core=0
+  local missing=""
+  local bl_count=0
+  local bl_dups_note=""
+  if [[ -f ${CMDLINE} ]]; then
+    local tokens=()
+    read -r -a tokens < "${CMDLINE}"
+    for m in "${tokens[@]}"; do
+      if [[ ${m} == "module_blacklist="* ]]; then
+        have_blacklist=1
+        bl_count=$((bl_count+1))
+        blacklist=${m#module_blacklist=}
+      fi
+    done
+    if [[ ${bl_count} -gt 1 ]]; then
+      bl_dups_note=" Multiple 'module_blacklist=' tokens were found on the cmdline; the last one (shown above) takes effect."
+    fi
+    if [[ ${have_blacklist} -eq 1 ]]; then
+      IFS=',' read -r -a bl_modules <<< "${blacklist}"
+      if cxl_register_locator_dvsec_list_contains "cxl_core" "${bl_modules[@]}"; then
+        has_core=1
+      fi
+      for m in cxl_acpi cxl_pci cxl_port cxl_mem; do
+        if ! cxl_register_locator_dvsec_list_contains "${m}" "${bl_modules[@]}"; then
+          missing+="${m} "
+        fi
+      done
+    fi
+  else
+    notes+="cmdline not collected, workaround state unknown; "
+  fi
+
+  # Kernel config dependent checks (skipped when the config file is missing)
+  local cxl_region_unset=0
+  local builtin_bad=""
+  if [[ -f ${KCONFIG} ]]; then
+    if ${GREP} -qE "^# CONFIG_CXL_REGION is not set$" "${KCONFIG}" \
+       || ${GREP} -qE "^CONFIG_CXL_REGION=n$" "${KCONFIG}"; then
+      cxl_region_unset=1
+    fi
+    for m in CXL_ACPI CXL_PCI CXL_PORT CXL_MEM; do
+      if ${GREP} -qE "^CONFIG_${m}=y$" "${KCONFIG}"; then
+        builtin_bad+="CONFIG_${m}=y "
+      fi
+    done
+  else
+    notes+="kernel config not collected, CONFIG_* checks skipped; "
+  fi
+
+  # Was the blacklist effective (none of the four modules still loaded)?
+  local loaded_bad=""
+  local lsmod_verified=""
+  if [[ -f ${LSMOD} ]]; then
+    for m in cxl_acpi cxl_pci cxl_port cxl_mem; do
+      if ${GREP} -qE "^${m}[[:space:]]" "${LSMOD}"; then
+        loaded_bad+="${m} "
+      fi
+    done
+    if [[ -z ${loaded_bad} ]]; then
+      lsmod_verified=", verified not loaded via lsmod"
+    fi
+  else
+    notes+="lsmod not collected, blacklist effectiveness unverified; "
+  fi
+
+  ##################################################################################################################
+  # Step C: decision matrix (applies because at least one device is affected)
+  ##################################################################################################################
+
+  # An RCH host bridge is present - the affected device may be a CXL 1.1 RCD,
+  # for which the Register Locator DVSEC is optional. Downgrade to INFO.
+  if [[ ${rch_detected} -eq 1 ]]; then
+    rule_result INFO "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}This host has a Restricted CXL Host (RCH) host bridge (dmesg: 'host supports CXL (restricted)'). CXL 1.1 RCDs locate component registers through the RCRB and the DVSEC is optional for them, so this may be expected. See ${KB_ID}"
+    return
+  fi
+
+  # Kernel < 7.0: the legacy HMEM path still handles the Soft Reserved range
+  if [[ ${is_ge_70} -eq 0 ]]; then
+    rule_result WARNING "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}Kernel ${release} (< 7.0) still creates DAX devices via the legacy dax_hmem path. Upgrading to Linux >= 7.0 will stop DAX devices from being created unless the workaround is applied (module_blacklist=cxl_acpi,cxl_pci,cxl_port,cxl_mem, or a kernel with CONFIG_CXL_REGION=n). See ${KB_ID}"
+    return
+  fi
+
+  # Kernel >= 7.0, kernel built without CXL region support (supported alternative workaround)
+  if [[ ${cxl_region_unset} -eq 1 ]]; then
+    rule_result INFO "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}Kernel ${release} is built without CXL region support (CONFIG_CXL_REGION is not set), so HMEM owns the Soft Reserved ranges (supported alternative workaround). CXL memory is unusable via the CXL subsystem on this host. See ${KB_ID}"
+    return
+  fi
+
+  # Kernel >= 7.0 with a module_blacklist= present
+  if [[ ${have_blacklist} -eq 1 ]]; then
+    # cxl_core must never be blacklisted - dax_hmem depends on it
+    if [[ ${has_core} -eq 1 ]]; then
+      rule_result FAILED "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}The effective 'module_blacklist=${blacklist}' lists cxl_core, which must NOT be blacklisted - dax_hmem depends on it. Use exactly module_blacklist=cxl_acpi,cxl_pci,cxl_port,cxl_mem.${bl_dups_note} See ${KB_ID}"
+      return
+    fi
+    # All four modules must be blacklisted together
+    if [[ -n ${missing} ]]; then
+      rule_result FAILED "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}The effective 'module_blacklist=${blacklist}' is missing: ${missing}All four modules (cxl_acpi,cxl_pci,cxl_port,cxl_mem) must be listed together.${bl_dups_note} See ${KB_ID}"
+      return
+    fi
+    # The blacklist is correct - but a built-in driver cannot be blacklisted
+    if [[ -n ${builtin_bad} ]]; then
+      rule_result FAILED "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}The cmdline blacklist is correct, but the kernel is built with ${builtin_bad} A built-in driver cannot be blacklisted; use a kernel with modular CXL drivers or CONFIG_CXL_REGION=n. See ${KB_ID}"
+      return
+    fi
+    # The blacklist is correct - but the modules are still loaded, so it did not take effect
+    if [[ -n ${loaded_bad} ]]; then
+      rule_result FAILED "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}The cmdline blacklist is correct, but lsmod shows the following still loaded: ${loaded_bad}The blacklist did not take effect - check for a later duplicate 'module_blacklist=' token on the cmdline (the last occurrence wins). See ${KB_ID}"
+      return
+    fi
+    # The blacklist is correct and effective
+    if [[ ${dax_present} -eq 1 ]]; then
+      rule_result INFO "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}The workaround is active (module_blacklist=cxl_acpi,cxl_pci,cxl_port,cxl_mem${lsmod_verified}) and a DAX device is present. The CXL subsystem is disabled host-wide by this blacklist, which affects all CXL devices on this host. Remove the workaround once a fixed kernel/BIOS is installed. ${notes}See ${KB_ID}"
+      return
+    fi
+    rule_result FAILED "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}The workaround is in place, but no DAX device was found. ${notes}Check that the BIOS exposes the range as Soft Reserved/EFI_MEMORY_SP, that 'efi=nosoftreserve' is absent from the cmdline, and that CONFIG_DEV_DAX_HMEM is enabled. See ${KB_ID}"
+    return
+  fi
+
+  # Kernel >= 7.0, no workaround
+  if [[ ${dax_present} -eq 0 ]]; then
+    rule_result CRITICAL "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}${rcd_caveat}Kernel ${release} is >= 7.0: no workaround was detected and no DAX device exists, so CXL memory is unusable as devdax. Add 'module_blacklist=cxl_acpi,cxl_pci,cxl_port,cxl_mem' to the kernel command line (do NOT include cxl_core), or use a kernel with CONFIG_CXL_REGION=n. ${notes}See ${KB_ID}"
+    return
+  fi
+  rule_result WARNING "CXL.mem device(s) without a CXL Register Locator DVSEC (1e98:0008): ${affected_display}${rcd_caveat}Kernel ${release} is >= 7.0: no workaround was detected, but a DAX device is present. The affected device lacks the Register Locator DVSEC yet DAX memory exists - the platform may differ from the known failure mode. Report this to Liqid. ${notes}See ${KB_ID}"
+}
+
+# Call the main function
+cxl_register_locator_dvsec "${OUTPUT_PATH}/lspci_-vv" "${OUTPUT_PATH}/uname_-a" "${OUTPUT_PATH}/cmdline" "${OUTPUT_PATH}/lspci_-nn" "${OUTPUT_PATH}/kernel_config" "${OUTPUT_PATH}/lsmod" "${OUTPUT_PATH}/ls_-l__sys_bus_platform_devices_" "${OUTPUT_PATH}/daxctl_list" "${OUTPUT_PATH}/dmesg_-T"
+
+set +x

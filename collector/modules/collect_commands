@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 #################################################################################################
 # Execute commands to collect data
 #################################################################################################
@@ -16,6 +17,7 @@ function collect_cmds() {
     "lscpu -p=CPU,NODE,SOCKET"
     "lspci"
     "lspci -vv"
+    "lspci -nn"
     "lspci -tvvv"
     "lsmem"
     "lsmem -o RANGE,SIZE,STATE,REMOVABLE,ZONES,NODE,BLOCK"
@@ -29,6 +31,7 @@ function collect_cmds() {
     "mount -v"
     "uname -a"
     "ls -l /sys/bus/cxl/devices/"
+    "ls -l /sys/bus/platform/devices/"
     "grep -r . /sys/kernel/mm/numa/"
     "grep -r . /sys/devices/virtual/memory_tiering/"
     "grep -r . /sys/kernel/mm/mempolicy/weighted_interleave/"
@@ -51,9 +54,10 @@ function collect_cmds() {
   )
 
   # Initialize the progress bar
-  init_progressbar "${#commands_to_collect[@]}"
+  # One extra step for the kernel config collection below
+  init_progressbar "$((${#commands_to_collect[@]} + 1))"
 
-  for cmd in ${commands_to_collect[@]}; do
+  for cmd in "${commands_to_collect[@]}"; do
     # Provide progress to user
     inc_progressbar
 
@@ -79,6 +83,37 @@ function collect_cmds() {
       fi
     fi
   done
+
+  # Collect the running kernel's config. There is no single fixed command for it, so it
+  # is not part of the commands_to_collect array above: try /boot/config-$(uname -r)
+  # first, then fall back to /proc/config.gz (requires CONFIG_IKCONFIG_PROC).
+  # Stable output file name: 'kernel_config' (read by analyzer/cxl/register_locator_dvsec)
+  inc_progressbar
+  local kernel_config_file
+  kernel_config_file="/boot/config-$(uname -r)"
+  if [[ -f ${kernel_config_file} ]]; then
+    if ${CP} "${kernel_config_file}" "${OUTPUT_PATH}/kernel_config" 2> "${OUTPUT_PATH}/cp_kernel_config.err"; then
+      if [ ${OPT_VERBOSITY} -ge 1 ]; then
+        debug_msg "kernel config ${green}succeeded${normal}"
+      fi
+    else
+      if [ ${OPT_VERBOSITY} -ge 1 ]; then
+        debug_msg "kernel config ${red}failed${normal}"
+      fi
+    fi
+  elif [[ -n "${ZCAT}" && -f /proc/config.gz ]]; then
+    if "${ZCAT}" /proc/config.gz > "${OUTPUT_PATH}/kernel_config" 2> "${OUTPUT_PATH}/cp_kernel_config.err"; then
+      if [ ${OPT_VERBOSITY} -ge 1 ]; then
+        debug_msg "kernel config (from /proc/config.gz) ${green}succeeded${normal}"
+      fi
+    else
+      if [ ${OPT_VERBOSITY} -ge 1 ]; then
+        debug_msg "kernel config (from /proc/config.gz) ${red}failed${normal}"
+      fi
+    fi
+  elif [ ${OPT_VERBOSITY} -ge 1 ]; then
+    debug_msg "kernel config ${yellow}not found${normal}"
+  fi
   echo ""
 }
 
