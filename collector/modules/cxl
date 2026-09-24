@@ -26,7 +26,7 @@ function cxl_collector() {
   # Initialize the progress bar
   init_progressbar "${#cxl_args[@]}"
 
-  for arg in ${cxl_args[@]}; do
+  for arg in "${cxl_args[@]}"; do
     # Provide progress to user
     inc_progressbar
 

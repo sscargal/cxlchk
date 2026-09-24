@@ -30,6 +30,7 @@ CP=("$(command -v cp)")				      # Path to cp
 FIND=("$(command -v find)")         # Path to find
 TEE=("$(command -v tee)")           # Path to tee
 TAIL=("$(command -v tail)")         # Path to tail
+ZCAT=("$(command -v zcat)")         # Path to zcat, used to read /proc/config.gz (kernel config fallback)
 
 OUTPUT_PATH="./cxlchk.`hostname`.`date +"%m%d-%H%M"`" # output directory created by this script
 STDOUT_LOG_FILE="cxlchk.log"			# Filename to save STDOUT and STDERR
